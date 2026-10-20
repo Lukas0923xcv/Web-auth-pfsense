@@ -23,11 +23,11 @@ cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/we
 rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
 
-The installer copies the files, lint-checks them, patches `/etc/inc/authgui.inc`, `/etc/inc/auth_check.inc` and `/usr/local/www/xmlrpc.php` (keeping copies with the suffix `.webauthn-orig`), and adds **System > WebAuthn Passkeys** to the menu. The second factor stays **disabled** until you turn it on.
+The installer copies the files, lint-checks them, patches `/etc/inc/authgui.inc`, `/etc/inc/auth_check.inc` and `/usr/local/www/xmlrpc.php` (keeping copies with the suffix `.webauthn.orig`, which pfSense's web server refuses to serve), and adds **System > WebAuthn Passkeys** to the menu. The second factor stays **disabled** until you turn it on.
 
 - Check the hooks: `/usr/local/pkg/webauthn/hook.php status`. It prints one line per file: `present`, `OUTDATED` (re-run the installer) or `MISSING`.
 - Uninstall: `sh uninstall.sh`. Passkeys and settings stay in `config.xml`.
-- Upgrades: a pfSense upgrade replaces the patched files. `/usr/local/etc/rc.d/webauthn_hook.sh` re-applies the hooks at every boot, and pfSense upgrades reboot. Still, run `hook.php status` after upgrading. If pfSense ever changes the code a hook is anchored to, that hook is **not** applied, the installer exits with an error, and `webauthn: could not patch <file>` is logged.
+- Upgrades: a pfSense upgrade replaces the patched files. The hooks are re-applied at every boot by `/usr/local/etc/rc.d/webauthn_hook.sh`, and every 5 minutes by a cron job stored in config.xml (System > Cron if the Cron package is installed). The first boot after an upgrade can skip package start scripts, which is why the cron job exists. Still, run `hook.php status` after upgrading. If pfSense ever changes the code a hook is anchored to, that hook is **not** applied, the installer exits with an error, and `webauthn: could not patch <file>` is logged.
 - The hooks load the package files unconditionally. If the files are removed without running the uninstaller, the GUI stops working (fail closed) rather than skipping the passkey step.
 
 ## Access path: Cloudflare Tunnel + Cloudflare Access
@@ -118,7 +118,7 @@ Once a user has a passkey, adding another requires a session that signed in **wi
 
 Recovery, if every passkey is lost: log in from a trusted network, remove the lost passkeys, then register a new one. Without a trusted network, run `/usr/local/pkg/webauthn/hook.php uninstall` from the console.
 
-Usernames are matched case-insensitively (`Admin` and `admin` share passkeys), because LDAP and RADIUS accept either.
+Passkeys belong to the **exact** username, because pfSense local accounts are case-sensitive: `Bob` and `bob` can be two different people. LDAP and RADIUS accept either capitalisation for the same person. So if `admin` has passkeys, signing in as `Admin` is stopped with a message to use the registered spelling, rather than skipping the passkey step.
 
 Users with the `page-all` privilege (admins) manage everyone's passkeys and the settings. Other users can register and remove only their own passkeys, if they are granted access to `system_webauthn.php`.
 
@@ -133,12 +133,12 @@ Users with the `page-all` privilege (admins) manage everyone's passkeys and the 
 - Add-on packages with their own authentication, such as a REST API package.
 
 **When the second factor silently switches off (fail-open):**
-- **The hook is missing.** This happens after a pfSense upgrade, until the boot script re-applies it, or if pfSense ever changes the code the hook is anchored to. Run `/usr/local/pkg/webauthn/hook.php status` after upgrades.
+- **The hook is missing.** This happens after a pfSense upgrade, for up to 5 minutes until the cron job re-applies it, or if pfSense ever changes the code the hook is anchored to. Run `/usr/local/pkg/webauthn/hook.php status` after upgrades.
 - **The settings are gone.** This happens when you restore a config backup taken before WebAuthn was enabled. The Passkeys tab then shows "disabled".
 
 Errors inside the gate fail closed: the page does not load.
 
-**Trusted networks** skip the passkey entirely. Anyone in them who knows a password can act as that user, and can register a first passkey for a user who has none. Keep the list as narrow as possible: your admin PC's address, or a management VLAN, rather than a whole LAN with guests and IoT devices.
+**Trusted networks** skip the passkey entirely. An admin session from a trusted network is effectively root: it can turn the second factor off, remove passkeys, or run shell commands under Diagnostics > Command Prompt. The rule that a second passkey needs a passkey-verified session only slows such an attacker down. Every one of those changes raises a notice, but the real protection is keeping trusted networks narrow. Keep the list as narrow as possible: your admin PC's address, or a management VLAN, rather than a whole LAN with guests and IoT devices.
 
 **User verification:** *Required* makes the authenticator ask for a PIN or biometric on every use. Choose it if your authenticators support it.
 
@@ -149,7 +149,7 @@ Errors inside the gate fail closed: the page does not load.
 ```sh
 php tests/run.php         # verifier, CBOR, policy, settings validation, authgui hook (79 checks)
 php tests/gate_test.php   # end-to-end gate requests with a software authenticator (14 checks)
-php tests/audit_test.php  # security audit regressions F1-F7, incl. the real patched auth_check.inc (47 checks)
+php tests/audit_test.php  # security audit regressions F1-F7, incl. the real patched auth_check.inc (50 checks)
 ```
 
 `tests/fixtures/` holds pfSense's upstream `authgui.inc`, `auth_check.inc` and `xmlrpc.php` (Apache-2.0). The tests use them to check that every hook anchor matches and that each patched file still parses.

@@ -9,8 +9,10 @@
  *              the System menu entry
  *   uninstall  remove the patches and the menu entry
  *   status     exit 0 if every hook is in place and current, 1 if not
- *   ensure     (re-)apply missing or outdated hooks (run at boot, since a
- *              pfSense upgrade replaces the patched files)
+ *   ensure     (re-)apply missing or outdated hooks. Runs at boot and
+ *              every 5 minutes from cron, since a pfSense upgrade replaces
+ *              the patched files and the first boot after an upgrade may
+ *              skip package start scripts.
  *
  * Licensed under the Apache License, Version 2.0.
  */
@@ -20,6 +22,15 @@ require_once('util.inc');
 require_once(__DIR__ . '/hook.inc');
 
 define('WEBAUTHN_MENU_URL', '/system_webauthn.php');
+define('WEBAUTHN_CRON_COMMAND', '/usr/local/bin/php -f /usr/local/pkg/webauthn/hook.php ensure');
+
+/*
+ * Backups end in ".orig": xmlrpc.php lives in the web root, and nginx on
+ * pfSense refuses to serve *.orig (and *.inc) files.
+ */
+function backup_path(string $file): string {
+	return $file . '.webauthn.orig';
+}
 
 /* Apply the current hook to one target. Returns true when it is in place. */
 function patch_target(string $target): bool {
@@ -28,6 +39,14 @@ function patch_target(string $target): bool {
 	if ($src === false) {
 		fwrite(STDERR, "Cannot read {$file}\n");
 		return false;
+	}
+	/* Older versions used a suffix that nginx would serve from the web root. */
+	if (file_exists($file . '.webauthn-orig')) {
+		if (!file_exists(backup_path($file))) {
+			rename($file . '.webauthn-orig', backup_path($file));
+		} else {
+			unlink($file . '.webauthn-orig');
+		}
 	}
 	if (webauthn_hook_current($src, $target)) {
 		return true;
@@ -38,10 +57,10 @@ function patch_target(string $target): bool {
 		syslog(LOG_USER | LOG_ERR, "webauthn: could not patch {$file}; WebAuthn protection is incomplete");
 		return false;
 	}
-	if (!webauthn_hook_present($src) && !file_exists($file . '.webauthn-orig')) {
-		copy($file, $file . '.webauthn-orig');
+	if (!webauthn_hook_present($src) && !file_exists(backup_path($file))) {
+		copy($file, backup_path($file));
 	}
-	$tmp = $file . '.webauthn-tmp';
+	$tmp = $file . '.webauthn-tmp.orig';
 	file_put_contents($tmp, $new);
 	exec('/usr/local/bin/php -l ' . escapeshellarg($tmp) . ' 2>&1', $out, $rc);
 	if ($rc != 0) {
@@ -72,6 +91,12 @@ function unpatch_all(): void {
 	}
 }
 
+/* Re-apply the hooks every 5 minutes; kept in config.xml, so it survives upgrades. */
+function set_cron(bool $present): void {
+	require_once('services.inc');
+	install_cron_job(WEBAUTHN_CRON_COMMAND, $present, '*/5');
+}
+
 function set_menu(bool $present): void {
 	$menus = config_get_path('installedpackages/menu', []);
 	$menus = is_array($menus) ? $menus : [];
@@ -89,9 +114,11 @@ switch ($argv[1] ?? '') {
 case 'install':
 	$ok = patch_all();
 	set_menu(true);
+	set_cron(true);
 	echo $ok ? "WebAuthn hooks installed.\n" : "WebAuthn hooks INCOMPLETE, see errors above.\n";
 	exit($ok ? 0 : 1);
 case 'uninstall':
+	set_cron(false);
 	unpatch_all();
 	set_menu(false);
 	echo "WebAuthn hooks removed. Passkeys and settings remain in config.xml.\n";
@@ -106,7 +133,12 @@ case 'status':
 		$ok = $ok && $state === 'present';
 		echo "{$target}: hook {$state}\n";
 	}
-	exit($ok ? 0 : 1);
+	$cron = false;
+	foreach (config_get_path('cron/item', []) as $item) {
+		$cron = $cron || (($item['command'] ?? '') === WEBAUTHN_CRON_COMMAND);
+	}
+	echo 'cron: re-apply job ' . ($cron ? 'present' : 'MISSING') . "\n";
+	exit($ok && $cron ? 0 : 1);
 default:
 	fwrite(STDERR, "usage: {$argv[0]} install|uninstall|status|ensure\n");
 	exit(2);

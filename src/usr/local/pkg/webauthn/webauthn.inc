@@ -54,13 +54,34 @@ function webauthn_settings(): array {
 }
 
 /*
- * Canonical form of a GUI username for passkey storage, lookup and session
- * state. LDAP and RADIUS accept usernames case-insensitively, so "Admin"
- * must find the passkeys of "admin" rather than look like a user without
- * any (which would skip the passkey step while enforcement is off).
+ * Passkeys belong to the exact username (surrounding spaces trimmed).
+ * pfSense local accounts are case-sensitive, so "Bob" and "bob" can be
+ * two different people: they must never share passkeys.
  */
 function webauthn_normalize_username(?string $username): string {
+	return trim((string)$username);
+}
+
+/*
+ * Case-folded form, used only to stop case variants from skipping the
+ * passkey step: LDAP and RADIUS accept "Admin" for "admin", and without
+ * this "Admin" would look like a user with no passkeys.
+ */
+function webauthn_username_fold(?string $username): string {
 	return strtolower(trim((string)$username));
+}
+
+/* Passkeys registered under a different capitalisation of $username. */
+function webauthn_case_variant_credentials(string $username): array {
+	$out = [];
+	foreach (webauthn_all_credentials() as $c) {
+		$name = webauthn_normalize_username($c['username'] ?? '');
+		if ($name !== webauthn_normalize_username($username) &&
+		    webauthn_username_fold($name) === webauthn_username_fold($username)) {
+			$out[] = $c;
+		}
+	}
+	return $out;
 }
 
 /* Split a whitespace/comma separated list, dropping empties. */
@@ -211,7 +232,9 @@ function webauthn_session_status(array $settings, array $session, array $source)
 	    webauthn_find_credential($user, $state['credential']) !== null) {
 		return 'verified';
 	}
-	return webauthn_gate_decision($settings, $source, !empty(webauthn_get_credentials($user)));
+	/* A case variant with passkeys counts: it must not skip the step. */
+	$has = !empty(webauthn_get_credentials($user)) || !empty(webauthn_case_variant_credentials($user));
+	return webauthn_gate_decision($settings, $source, $has);
 }
 
 function webauthn_rp_id(?array $settings = null): string {

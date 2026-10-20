@@ -74,6 +74,15 @@ function webauthn_gate(): void {
 		exit;
 	}
 
+	if (empty(webauthn_get_credentials($user))) {
+		/* Only a different capitalisation of this username has passkeys
+		 * (possible with LDAP/RADIUS). They belong to that exact name. */
+		webauthn_log(LOG_WARNING, "user '{$user}' has no passkey, but a differently capitalised username does; access refused", $source);
+		phpsession_end(true);
+		webauthn_render_gate_page('case', $settings, null, '');
+		exit;
+	}
+
 	if ($action == 'assert') {
 		$result = webauthn_gate_check_assertion($user, $settings);
 		if (is_array($result)) {
@@ -232,6 +241,9 @@ function webauthn_render_gate_page(string $mode, array $settings, ?array $option
 <?php endforeach; ?>
 								</ul>
 							</div>
+<?php elseif ($mode == 'case'): ?>
+							<input type="hidden" name="webauthn_action" value="cancel" />
+							<p style="color:#fff"><?=gettext('The passkeys for this account are registered under a differently capitalised username. Sign out, then sign in with the username exactly as it was registered.')?></p>
 <?php else: ?>
 							<input type="hidden" name="webauthn_action" value="cancel" />
 							<p style="color:#fff"><?=gettext('This account has no registered passkey, and a passkey is required from this network. Register one from a trusted network first.')?></p>

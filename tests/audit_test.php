@@ -147,27 +147,33 @@ check(run_auth_check($patched, $removed, ['Username' => 'admin', 'page-match' =>
     'F1/F7: fast path revoked once the verifying passkey is removed');
 
 /* ------------------------------------------------------------------ */
-/* F2: username case variants must find the same passkeys.            */
+/* F2: a username case variant must not skip the passkey step.         */
+/* R5: ...and must not use another account's passkey (pfSense local    */
+/*     accounts are case-sensitive: "Bob" and "bob" are two people).   */
 /* ------------------------------------------------------------------ */
 
 $GLOBALS['test_config'] = $config;
-check(count(webauthn_get_credentials('Admin')) === 1 && count(webauthn_get_credentials(' ADMIN ')) === 1,
-    'F2: credential lookup ignores case and surrounding spaces');
 $src = webauthn_request_source($tunnel, $settings);
+check(count(webauthn_get_credentials(' admin ')) === 1, 'F2: lookup trims surrounding spaces');
+check(count(webauthn_get_credentials('Admin')) === 0 && count(webauthn_case_variant_credentials('Admin')) === 1,
+    'R5: passkeys belong to the exact username; case variants are only detected');
 check(webauthn_session_status($settings, ['Username' => 'Admin'], $src) === 'require',
-    'F2: "Admin" with enforcement off must pass the passkey step, not skip it');
+    'F2: "Admin" with enforcement off must not skip the passkey step');
 check(webauthn_session_status($settings, ['Username' => 'ADMIN', 'webauthn' =>
-    ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred['record']['id']]], $src) === 'verified',
-    'F2: session state compares normalised usernames');
+    ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred['record']['id']]], $src) === 'require',
+    'R5: a session verified as "admin" does not carry over to "ADMIN"');
+check(webauthn_find_credential('Admin', $cred['record']['id']) === null, 'R5: "Admin" cannot verify with the passkey of "admin"');
 $ch = webauthn_new_challenge('login', 'Admin');
-check(webauthn_take_challenge('login', 'admin', json_encode(['challenge' => webauthn_b64url_encode($ch)])) === $ch,
-    'F2: challenges bind the normalised username');
+check(webauthn_take_challenge('login', 'admin', json_encode(['challenge' => webauthn_b64url_encode($ch)])) === null,
+    'R5: challenges bind the exact username');
 $GLOBALS['test_config'] = ['installedpackages' => ['webauthn' => ['config' => [$settings]]]];
 $a = new FakeAuthenticator(WEBAUTHN_ALG_ES256);
 $ch = random_bytes(32);
 [$cd, $att] = $a->create($ch, $rp, $public);
-webauthn_add_credential('Admin ', 'k', webauthn_verify_registration($cd, $att, $ch, $rp, [$public], false), $rp);
-check(webauthn_get_credentials()[0]['username'] === 'admin', 'F2: usernames stored normalised');
+webauthn_add_credential(' Bob ', 'k', webauthn_verify_registration($cd, $att, $ch, $rp, [$public], false), $rp);
+check(webauthn_get_credentials()[0]['username'] === 'Bob', 'R5: usernames stored exactly (trimmed)');
+check(webauthn_get_credentials('bob') === [] && webauthn_delete_credential(webauthn_get_credentials('Bob')[0]['id'], 'bob') === false,
+    'R5: "bob" can neither use nor delete the passkey of "Bob"');
 
 /* ------------------------------------------------------------------ */
 /* F3: trusted networks need a configured cloudflared source.          */
@@ -271,7 +277,7 @@ file_put_contents($state, serialize([
 	'session' => ['Username' => 'Admin', 'Logged_In' => 'True'],
 	'authenticator' => $c['authenticator']->toState(),
 ]));
-check(!(gate_req($state, ['server' => $tunnel])['returned'] ?? true), 'F2: gate requires the passkey for "Admin"');
+check(!(gate_req($state, ['server' => $tunnel])['returned'] ?? true), 'F2: gate stops "Admin" (passkeys exist under "admin")');
 unlink($state);
 
 /* ------------------------------------------------------------------ */
