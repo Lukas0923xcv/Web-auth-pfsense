@@ -18,16 +18,15 @@ function webauthn_gate(): void {
 	}
 
 	phpsession_begin();
-	$user = (string)($_SESSION['Username'] ?? '');
+	$user = webauthn_normalize_username($_SESSION['Username'] ?? '');
 	$state = $_SESSION['webauthn'] ?? null;
-	if (is_array($state) && ($state['user'] ?? null) === $user && ($state['method'] ?? null) === 'webauthn') {
+	$source = webauthn_request_source($_SERVER, $settings);
+	$decision = webauthn_session_status($settings, $_SESSION, $source);
+
+	if ($decision == 'verified') {
 		phpsession_end();
 		return;
 	}
-
-	$source = webauthn_request_source($_SERVER, $settings);
-	$has_credentials = !empty(webauthn_get_credentials($user));
-	$decision = webauthn_gate_decision($settings, $source, $has_credentials);
 
 	if ($decision == 'skip') {
 		$method = webauthn_source_is_trusted_network($source, $settings) ? 'trusted-network' : 'no-credential';
@@ -58,6 +57,10 @@ function webauthn_gate(): void {
 		exit;
 	}
 
+	if (is_array($state) && ($state['method'] ?? null) === 'webauthn') {
+		webauthn_log(LOG_NOTICE, "session of user '{$user}' needs a new passkey verification (its passkey was removed)", $source);
+	}
+
 	$action = $_POST['webauthn_action'] ?? '';
 	if ($action == 'cancel') {
 		webauthn_gate_logout();
@@ -73,9 +76,9 @@ function webauthn_gate(): void {
 
 	if ($action == 'assert') {
 		$result = webauthn_gate_check_assertion($user, $settings);
-		if ($result === true) {
+		if (is_array($result)) {
 			session_regenerate_id(true);
-			$_SESSION['webauthn'] = ['user' => $user, 'method' => 'webauthn', 'time' => time()];
+			$_SESSION['webauthn'] = ['user' => $user, 'method' => 'webauthn', 'credential' => $result['id'], 'time' => time()];
 			unset($_SESSION['webauthn_failures']);
 			webauthn_log(LOG_NOTICE, "user '{$user}' verified with passkey", $source);
 			phpsession_end(true);
@@ -114,7 +117,7 @@ function webauthn_gate(): void {
 	exit;
 }
 
-/* Returns true on success or an error string. Session must be open. */
+/* Returns the verified credential on success, or an error string. Session must be open. */
 function webauthn_gate_check_assertion(string $user, array $settings) {
 	try {
 		$client_data = webauthn_b64url_decode((string)($_POST['client_data'] ?? ''));
@@ -141,7 +144,7 @@ function webauthn_gate_check_assertion(string $user, array $settings) {
 			webauthn_require_uv($settings)
 		);
 		webauthn_set_sign_count($cred['id'], $count);
-		return true;
+		return $cred;
 	} catch (WebAuthnException $e) {
 		return $e->getMessage();
 	}
@@ -247,4 +250,21 @@ function webauthn_render_gate_page(string $mode, array $settings, ?array $option
 	</body>
 </html>
 <?php
+}
+
+/*
+ * Called from the auth_check.inc hook. pfSense's lightweight auth check
+ * accepts the session's cached page privileges without authgui.inc;
+ * allow that only when the gate would let this session through now.
+ */
+function webauthn_cached_privileges_allowed(): bool {
+	$settings = webauthn_settings();
+	if (empty($settings['enable'])) {
+		return true;
+	}
+	@phpsession_begin();
+	$session = is_array($_SESSION ?? null) ? $_SESSION : [];
+	@phpsession_end();
+	$status = webauthn_session_status($settings, $session, webauthn_request_source($_SERVER, $settings));
+	return in_array($status, ['verified', 'skip'], true);
 }

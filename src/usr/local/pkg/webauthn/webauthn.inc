@@ -53,6 +53,16 @@ function webauthn_settings(): array {
 	return array_merge(webauthn_default_settings(), is_array($s) ? $s : []);
 }
 
+/*
+ * Canonical form of a GUI username for passkey storage, lookup and session
+ * state. LDAP and RADIUS accept usernames case-insensitively, so "Admin"
+ * must find the passkeys of "admin" rather than look like a user without
+ * any (which would skip the passkey step while enforcement is off).
+ */
+function webauthn_normalize_username(?string $username): string {
+	return strtolower(trim((string)$username));
+}
+
 /* Split a whitespace/comma separated list, dropping empties. */
 function webauthn_split_list(?string $s): array {
 	return array_values(array_filter(preg_split('/[\s,]+/', (string)$s), 'strlen'));
@@ -175,6 +185,35 @@ function webauthn_gate_decision(array $settings, array $source, bool $has_creden
 	return empty($settings['enforce']) ? 'skip' : 'deny';
 }
 
+/*
+ * Where a GUI session stands with respect to the second factor.
+ *   'disabled'  - the second factor is off
+ *   'verified'  - passed WebAuthn with a passkey that is still registered
+ *   'skip'      - exempt for this request (trusted network, or no passkey
+ *                 while enforcement is off)
+ *   'require'   - must pass WebAuthn now
+ *   'deny'      - no passkey and enforcement is on
+ * $session is $_SESSION. Removing a passkey revokes the sessions it
+ * verified, because 'verified' re-checks that the passkey still exists.
+ */
+function webauthn_session_status(array $settings, array $session, array $source): string {
+	if (empty($settings['enable'])) {
+		return 'disabled';
+	}
+	$user = webauthn_normalize_username($session['Username'] ?? '');
+	if ($user === '') {
+		return 'require';
+	}
+	$state = $session['webauthn'] ?? null;
+	if (is_array($state) && ($state['method'] ?? null) === 'webauthn' &&
+	    webauthn_normalize_username($state['user'] ?? '') === $user &&
+	    is_string($state['credential'] ?? null) &&
+	    webauthn_find_credential($user, $state['credential']) !== null) {
+		return 'verified';
+	}
+	return webauthn_gate_decision($settings, $source, !empty(webauthn_get_credentials($user)));
+}
+
 function webauthn_rp_id(?array $settings = null): string {
 	$settings = $settings ?? webauthn_settings();
 	return strtolower(trim($settings['rp_id']));
@@ -224,11 +263,19 @@ function webauthn_validate_settings(array $s): array {
 		}
 	}
 	/* A cloudflared address inside a trusted network is fine (tunnel
-	 * traffic is never exempt), but a 0.0.0.0/0-style entry is a mistake. */
-	foreach (webauthn_split_list($s['trusted_networks'] ?? '') as $c) {
-		if (preg_match('#/0$#', $c)) {
+	 * traffic is never exempt), but a /0 entry (however written, e.g. /00)
+	 * would exempt everyone. */
+	$trusted = webauthn_split_list($s['trusted_networks'] ?? '');
+	foreach ($trusted as $c) {
+		$parts = explode('/', $c, 2);
+		if (isset($parts[1]) && ctype_digit($parts[1]) && (int)$parts[1] === 0) {
 			$errors[] = gettext('A /0 trusted network would disable WebAuthn for everyone.');
 		}
+	}
+	/* Without the cloudflared address, tunnel traffic from a LAN host is
+	 * only told apart from LAN traffic by its proxy headers. */
+	if (!empty($trusted) && empty(webauthn_split_list($s['trusted_proxies'] ?? ''))) {
+		$errors[] = gettext('Set the cloudflared source before adding trusted networks, so tunnel traffic can never be mistaken for local traffic.');
 	}
 	if (!in_array($s['user_verification'] ?? '', ['discouraged', 'preferred', 'required'], true)) {
 		$errors[] = gettext('Invalid user verification setting.');
@@ -287,7 +334,7 @@ function webauthn_all_credentials(): array {
 function webauthn_get_credentials(?string $username = null): array {
 	$out = [];
 	foreach (webauthn_all_credentials() as $c) {
-		if (($username === null || ($c['username'] ?? null) === $username)) {
+		if ($username === null || webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username)) {
 			$out[] = $c;
 		}
 	}
@@ -297,7 +344,7 @@ function webauthn_get_credentials(?string $username = null): array {
 function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id): void {
 	$all = webauthn_all_credentials();
 	$all[] = [
-		'username' => $username,
+		'username' => webauthn_normalize_username($username),
 		'name' => $name,
 		'id' => webauthn_b64url_encode($reg['credential_id']),
 		'alg' => (string)$reg['alg'],
@@ -314,7 +361,8 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 function webauthn_delete_credential(string $id, ?string $username = null): bool {
 	$all = webauthn_all_credentials();
 	foreach ($all as $i => $c) {
-		if (($c['id'] ?? null) === $id && ($username === null || ($c['username'] ?? null) === $username)) {
+		if (($c['id'] ?? null) === $id && ($username === null ||
+		    webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username))) {
 			unset($all[$i]);
 			config_set_path(WEBAUTHN_CRED_PATH, array_values($all));
 			write_config(sprintf('WebAuthn: removed passkey "%s" of user %s', $c['name'] ?? '', $c['username'] ?? ''));
@@ -387,7 +435,7 @@ function webauthn_challenge_mac(string $purpose, string $username, string $paylo
 	if ($sid === '' || $sid === false) {
 		$sid = (string)($_COOKIE[session_name()] ?? '');
 	}
-	$data = implode("\0", [$purpose, $sid, $username, $payload]);
+	$data = implode("\0", [$purpose, $sid, webauthn_normalize_username($username), $payload]);
 	return substr(hash_hmac('sha256', $data, webauthn_hmac_key(), true), 0, 16);
 }
 

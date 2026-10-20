@@ -17,12 +17,23 @@
 require_once("guiconfig.inc");
 require_once("/usr/local/pkg/webauthn/webauthn.inc");
 
-$username = $_SESSION['Username'];
+$username = webauthn_normalize_username($_SESSION['Username']);
 /* page-all ("*") holders administer everyone's passkeys and the settings. */
 $is_admin = in_array('*', $allowedpages);
 $tab = ($is_admin && ($_REQUEST['tab'] ?? '') == 'settings') ? 'settings' : 'passkeys';
 $settings = webauthn_settings();
 $source = webauthn_request_source($_SERVER, $settings);
+/*
+ * A user who already has a passkey may only add another from a session
+ * verified with one (or while the second factor is off, when a password
+ * already grants everything). Otherwise a password alone, from a trusted network
+ * or while enforcement is off, would be enough to enrol an attacker's
+ * passkey for later use through the tunnel.
+ */
+phpsession_begin();
+$may_register = empty(webauthn_get_credentials($username)) ||
+    in_array(webauthn_session_status($settings, $_SESSION, $source), ['disabled', 'verified'], true);
+phpsession_end();
 $input_errors = [];
 $savemsg = '';
 if (isset($_GET['registered'])) {
@@ -40,7 +51,9 @@ if ($_POST['act'] == 'register') {
 	}
 	$challenge = webauthn_take_challenge('register', $username, $client_data);
 	$name = trim((string)$_POST['passkey_name']);
-	if ($challenge === null) {
+	if (!$may_register) {
+		$input_errors[] = gettext('You already have a passkey: sign in with it (through a non-trusted path) before adding another.');
+	} elseif ($challenge === null) {
 		$input_errors[] = gettext('The registration request expired or was already used. Try again.');
 	} elseif ($name === '' || strlen($name) > 64) {
 		$input_errors[] = gettext('Enter a passkey name of up to 64 characters.');
@@ -63,7 +76,8 @@ if ($_POST['act'] == 'register') {
 			}
 			webauthn_add_credential($username, $name, $reg, webauthn_rp_id($settings));
 			/* Holding a passkey just proven to the server satisfies the gate. */
-			$_SESSION['webauthn'] = ['user' => $username, 'method' => 'webauthn', 'time' => time()];
+			$_SESSION['webauthn'] = ['user' => $username, 'method' => 'webauthn',
+			    'credential' => webauthn_b64url_encode($reg['credential_id']), 'time' => time()];
 			webauthn_log(LOG_NOTICE, "user '{$username}' registered passkey '{$name}'", $source);
 			webauthn_notice(sprintf('Passkey "%s" was registered for user %s from %s.', $name, $username, $source['client']));
 			phpsession_end(true);
@@ -118,7 +132,7 @@ if ($_POST['act'] == 'register') {
 
 /* Registration options for this page load. */
 $reg_options = null;
-if ($tab == 'passkeys' && webauthn_rp_id($settings) !== '') {
+if ($tab == 'passkeys' && webauthn_rp_id($settings) !== '' && $may_register) {
 	phpsession_begin();
 	$reg_options = [
 		'challenge' => webauthn_b64url_encode(webauthn_new_challenge('register', $username)),
@@ -194,8 +208,10 @@ if ($tab == 'passkeys'):
 <div class="panel panel-default">
 	<div class="panel-heading"><h2 class="panel-title"><?=sprintf(gettext('Register a passkey for %s'), htmlspecialchars($username))?></h2></div>
 	<div class="panel-body">
-<?php if ($reg_options === null): ?>
+<?php if (webauthn_rp_id($settings) === ''): ?>
 		<p><?=gettext('Set the RP ID on the Settings tab first.')?></p>
+<?php elseif (!$may_register): ?>
+		<p><?=gettext('You already have a passkey. To add another, sign in through the passkey step first (for example through the tunnel, not from a trusted network), then come back here.')?></p>
 <?php else: ?>
 		<p id="webauthn-wronghost" class="text-danger" style="display:none"><?=gettext('Passkeys can only be registered when the GUI is opened on one of the allowed origins:')?>
 			<?=htmlspecialchars(implode(', ', webauthn_allowed_origins($settings)))?></p>

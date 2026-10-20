@@ -10,6 +10,7 @@ for f in \
 	usr/local/pkg/webauthn/webauthn.inc \
 	usr/local/pkg/webauthn/gate.inc \
 	usr/local/pkg/webauthn/hook.inc \
+	usr/local/pkg/webauthn/xmlrpc_guard.inc \
 	usr/local/pkg/webauthn/hook.php \
 	usr/local/www/system_webauthn.php \
 	usr/local/www/webauthn/webauthn.js \

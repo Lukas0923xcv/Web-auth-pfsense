@@ -76,6 +76,7 @@ function webauthn_cbor_decode_item(string $data, int &$offset, int $depth = 0) {
 			if (!is_int($k) && !is_string($k)) {
 				throw new WebAuthnCborException('CBOR map key type not supported');
 			}
+			$k = webauthn_cbor_map_key($k);
 			if (array_key_exists($k, $out)) {
 				throw new WebAuthnCborException('CBOR duplicate map key');
 			}
@@ -98,6 +99,21 @@ function webauthn_cbor_decode_item(string $data, int &$offset, int $depth = 0) {
 		throw new WebAuthnCborException('CBOR floats/simple values not supported');
 	}
 	throw new WebAuthnCborException('CBOR invalid major type');
+}
+
+/*
+ * PHP converts array keys like "1" to the integer 1, which would let a
+ * text key stand in for (or collide with) an integer key such as the
+ * COSE labels. Text keys that PHP would convert are prefixed so integer
+ * and text keys stay distinct; other text keys are kept as they are.
+ */
+define('WEBAUTHN_CBOR_TEXT_KEY_PREFIX', "\0text:");
+
+function webauthn_cbor_map_key(int|string $k): int|string {
+	if (is_string($k) && is_int(array_key_first([$k => true]))) {
+		return WEBAUTHN_CBOR_TEXT_KEY_PREFIX . $k;
+	}
+	return $k;
 }
 
 /* Decode a buffer that must contain exactly one CBOR item. */
