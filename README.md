@@ -12,7 +12,7 @@ Target: pfSense CE 2.8.1. The hook anchors on the `session_auth()` block in `/et
 
 Supported algorithms: ES256, RS256, and Ed25519 (when PHP's sodium extension is present). These cover current platform passkeys (iCloud Keychain, Google Password Manager, Windows Hello) and hardware keys (YubiKey and others). Attestation is not requested (`attestation: "none"`).
 
-Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, so they are included in config backups. Signature counters are kept in `/conf/webauthn_signcount.json` so that a login does not create a new config revision.
+Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, so they are included in config backups. Signature counters and the list of used challenges are kept in `/conf` (`webauthn_signcount.json`, `webauthn_used_challenges.json`) so that a login does not create a new config revision.
 
 ## Install
 
@@ -23,11 +23,11 @@ cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/we
 rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
 
-The installer copies the files, lint-checks them, patches `/etc/inc/authgui.inc`, `/etc/inc/auth_check.inc` and `/usr/local/www/xmlrpc.php` (keeping copies with the suffix `.webauthn.orig`, which pfSense's web server refuses to serve), and adds **System > WebAuthn Passkeys** to the menu. The second factor stays **disabled** until you turn it on.
+The installer copies the files, lint-checks them, patches `/etc/inc/authgui.inc`, `/etc/inc/auth_check.inc` and `/usr/local/www/xmlrpc.php` (keeping copies with the suffix `.webauthn.orig`, which pfSense's web server refuses to serve), adds **System > WebAuthn Passkeys** to the menu, and registers the boot command and cron job that re-apply the patches. The second factor stays **disabled** until you turn it on.
 
-- Check the hooks: `/usr/local/pkg/webauthn/hook.php status`. It prints one line per file: `present`, `OUTDATED` (re-run the installer) or `MISSING`.
+- Check the hooks: `/usr/local/pkg/webauthn/hook.php status`. It prints one line per file (`present`, `OUTDATED`: re-run the installer, or `MISSING`), plus whether the cron job and the boot command are in place.
 - Uninstall: `sh uninstall.sh`. Passkeys and settings stay in `config.xml`.
-- Upgrades: a pfSense upgrade replaces the patched files. The hooks are re-applied at every boot by `/usr/local/etc/rc.d/webauthn_hook.sh`, and every 5 minutes by a cron job stored in config.xml (System > Cron if the Cron package is installed). The first boot after an upgrade can skip package start scripts, which is why the cron job exists. Still, run `hook.php status` after upgrading. If pfSense ever changes the code a hook is anchored to, that hook is **not** applied, the installer exits with an error, and `webauthn: could not patch <file>` is logged.
+- Upgrades: a pfSense upgrade replaces the patched files. The hooks are re-applied early at every boot, before the GUI starts, by an `earlyshellcmd` entry in config.xml (this also runs on the first boot after an upgrade or a config restore, when package start scripts are skipped), by `/usr/local/etc/rc.d/webauthn_hook.sh`, and every 5 minutes by a cron job stored in config.xml (System > Cron if the Cron package is installed). Still, run `hook.php status` after upgrading. If pfSense ever changes the code a hook is anchored to, or a patched file cannot be written (for example on a full disk), that hook is **not** applied and the original file is left untouched. The installer exits with an error, `webauthn: could not patch <file>` is logged, and a GUI notice (also e-mailed, if configured) is raised once per boot.
 - The hooks load the package files unconditionally. If the files are removed without running the uninstaller, the GUI stops working (fail closed) rather than skipping the passkey step.
 
 ## Access path: Cloudflare Tunnel + Cloudflare Access
@@ -78,13 +78,18 @@ ingress:
     path: (?i)xmlrpc             # unanchored: also matches //xmlrpc.php, /./xmlrpc.php, /XMLRPC.php
     service: http_status:404     # XMLRPC uses HTTP basic auth (password only); never expose it
   - hostname: pfsense.example.com
+    path: (?i)^[/.]*status/?$    # php-fpm status page; see below
+    service: http_status:404
+  - hostname: pfsense.example.com
     service: https://127.0.0.1:443
     originRequest:
       noTLSVerify: true          # pfSense's self-signed GUI certificate
   - service: http_status:404
 ```
 
-`/xmlrpc.php` (HA sync) authenticates with a password over HTTP basic auth and does not go through the GUI login, so the WebAuthn step cannot protect it. The package therefore refuses XMLRPC requests that arrive from a cloudflared source address or carry proxy headers, whether or not the second factor is enabled. HA peers connect directly and are unaffected. Block it on the tunnel as well, with the **unanchored** rule shown above: an anchored `^/xmlrpc\.php` rule misses paths such as `//xmlrpc.php`, which pfSense's web server still serves.
+`/xmlrpc.php` (HA sync) authenticates with a password over HTTP basic auth and does not go through the GUI login, so the WebAuthn step cannot protect it, and its methods include running shell commands. The package therefore refuses XMLRPC requests that arrive from a cloudflared source address or carry proxy headers, whether or not the second factor is enabled. While the second factor is enabled, XMLRPC is also refused from every host that is neither on a trusted network nor listed under **XMLRPC peers** (Settings tab). **If you use HA, enter the partner's sync interface address there before enabling**, on both nodes, or configuration sync stops (refusals are logged as `webauthn: refused XMLRPC request`). Block it on the tunnel as well, with the **unanchored** rule shown above: an anchored `^/xmlrpc\.php` rule misses paths such as `//xmlrpc.php`, which pfSense's web server still serves.
+
+`/status` is php-fpm's status page. pfSense's web server serves it only to `127.0.0.1`, without a GUI login. When cloudflared runs on pfSense itself, every tunnel request comes from `127.0.0.1`, so anyone past Cloudflare Access could read it (it lists the URLs of requests in progress). The `status` rule above blocks it; running cloudflared on a separate host avoids the problem entirely.
 
 If the GUI runs over plain HTTP, pfSense does not set the `Secure` flag on its session cookie. The browser still talks HTTPS to Cloudflare, but keeping the GUI on HTTPS (with `noTLSVerify`) is preferable.
 
@@ -110,35 +115,35 @@ When you reach the GUI by an IP or another unlisted name from outside a trusted 
 ## Setup order (avoid locking yourself out)
 
 1. Install the package, then set the Alternate Hostnames and the Login Protection pass list.
-2. Under **System > WebAuthn Passkeys > Settings**, set the RP ID, the allowed origins, the cloudflared source, and the trusted networks. Leave **Enforce** off, then enable.
+2. Under **System > WebAuthn Passkeys > Settings**, set the RP ID, the allowed origins, the cloudflared source, the trusted networks and, with HA, the XMLRPC peers (on both nodes). Leave **Enforce** off, then enable.
 3. Open the GUI on an allowed hostname, then **Passkeys > Register passkey**. Register at least two authenticators.
 4. Turn on **Enforce**. Users without a passkey are then refused, except from trusted networks. The settings page refuses to save a change that would lock out the session making it.
 
-Once a user has a passkey, adding another requires a session that signed in **with** a passkey. A password alone, even from a trusted network, cannot enrol an extra passkey. Removing a passkey ends the sessions it verified at their next request.
+Once a user has a passkey, adding another requires a session that signed in **with** a passkey. A password alone, even from a trusted network, cannot enrol an extra passkey. Removing a passkey signs out the sessions it verified at their next request, even when it was the user's last passkey.
 
 Recovery, if every passkey is lost: log in from a trusted network, remove the lost passkeys, then register a new one. Without a trusted network, run `/usr/local/pkg/webauthn/hook.php uninstall` from the console.
 
-Passkeys belong to the **exact** username, because pfSense local accounts are case-sensitive: `Bob` and `bob` can be two different people. LDAP and RADIUS accept either capitalisation for the same person. So if `admin` has passkeys, signing in as `Admin` is stopped with a message to use the registered spelling, rather than skipping the passkey step.
+Passkeys belong to the **exact** username, because pfSense local accounts are case-sensitive: `Bob` and `bob` can be two different people, and each is treated on its own. LDAP and RADIUS accept other spellings for the same person: a different capitalisation, a `@domain` or `\suffix` (pfSense's LDAP code drops both), or full-width and extra-space variants. So if `admin` has passkeys, signing in through LDAP or RADIUS as `Admin` or `admin@corp` is stopped with a message to use the registered spelling, rather than skipping the passkey step. Such a spelling also cannot enrol a passkey of its own without a passkey-verified session. With LDAP or RADIUS, turn **Enforce** on as well: it refuses every account without a passkey, whatever the backend accepts as a name.
 
 Users with the `page-all` privilege (admins) manage everyone's passkeys and the settings. Other users can register and remove only their own passkeys, if they are granted access to `system_webauthn.php`.
 
 ## Security notes and limits
 
-**What is covered:** every web GUI page. That includes the lightweight status endpoints such as `getstats.php`, which use `auth_check.inc`: a hook makes them ignore the session's cached page privileges unless the session has passed the gate (or is exempt for this request). XMLRPC is refused when it arrives through the tunnel. Passkey registrations and removals, settings changes, and 5 failed passkey attempts after a correct password each raise a GUI notice. The notice is also sent by e-mail or another notification channel, if you have one configured.
+**What is covered:** every web GUI page. That includes the lightweight status endpoints such as `getstats.php`, which use `auth_check.inc`: a hook makes them ignore the session's cached page privileges unless the session has passed the gate (or is exempt for this request). XMLRPC is refused when it arrives through the tunnel and, while the second factor is enabled, from hosts that are not XMLRPC peers or on a trusted network. Passkey registrations and removals, settings changes, and 5 failed passkey attempts after a correct password each raise a GUI notice. The notice is also sent by e-mail or another notification channel, if you have one configured.
 
 **What is not covered:**
-- `/xmlrpc.php` reached directly on the LAN (password only). It is refused through the tunnel.
+- `/xmlrpc.php` from a configured XMLRPC peer or a trusted network (password only). It is refused from everywhere else while the second factor is enabled.
 - SSH and the console.
 - Other services (VPN and similar).
 - Add-on packages with their own authentication, such as a REST API package.
 
 **When the second factor silently switches off (fail-open):**
-- **The hook is missing.** This happens after a pfSense upgrade, for up to 5 minutes until the cron job re-applies it, or if pfSense ever changes the code the hook is anchored to. Run `/usr/local/pkg/webauthn/hook.php status` after upgrades.
+- **The hook is missing.** This happens during a pfSense upgrade until the next boot or cron run re-applies it (at most 5 minutes), if the boot command and cron job were removed (for example by restoring an old config backup), or if pfSense ever changes the code the hook is anchored to (a GUI notice is raised). Run `/usr/local/pkg/webauthn/hook.php status` after upgrades and restores.
 - **The settings are gone.** This happens when you restore a config backup taken before WebAuthn was enabled. The Passkeys tab then shows "disabled".
 
 Errors inside the gate fail closed: the page does not load.
 
-**Trusted networks** skip the passkey entirely. An admin session from a trusted network is effectively root: it can turn the second factor off, remove passkeys, or run shell commands under Diagnostics > Command Prompt. The rule that a second passkey needs a passkey-verified session only slows such an attacker down. Every one of those changes raises a notice, but the real protection is keeping trusted networks narrow. Keep the list as narrow as possible: your admin PC's address, or a management VLAN, rather than a whole LAN with guests and IoT devices.
+**Trusted networks** skip the passkey entirely. An admin session from a trusted network is effectively root: it can turn the second factor off, remove passkeys, or run shell commands under Diagnostics > Command Prompt. The rule that a second passkey needs a passkey-verified session only slows such an attacker down. Every one of those changes raises a notice, but the real protection is keeping trusted networks narrow. Keep the list as narrow as possible: a management VLAN, rather than a whole LAN with guests and IoT devices. A single address inside a shared LAN is weak: any host on that segment can take the address over while your PC is off.
 
 **User verification:** *Required* makes the authenticator ask for a PIN or biometric on every use. Choose it if your authenticators support it.
 
@@ -147,9 +152,13 @@ Errors inside the gate fail closed: the page does not load.
 ## Tests
 
 ```sh
-php tests/run.php         # verifier, CBOR, policy, settings validation, authgui hook (79 checks)
-php tests/gate_test.php   # end-to-end gate requests with a software authenticator (14 checks)
-php tests/audit_test.php  # security audit regressions F1-F7, incl. the real patched auth_check.inc (50 checks)
+php tests/run.php                        # verifier, CBOR, policy, settings validation, authgui hook (79 checks)
+php tests/gate_test.php                  # end-to-end gate requests with a software authenticator (14 checks)
+php tests/audit_test.php                 # security audit regressions F1-F7, incl. the real patched auth_check.inc (50 checks)
+php tests/review3/review3_test.php       # third review: username spellings, revocation, XMLRPC peers, nonce list (34 checks)
+php tests/review3/gate_ldap_variant.php  # third review, end to end through the gate (5 checks)
+php tests/review3/fuzz_parsers.php       # mutation fuzz of the CBOR / authenticator data / COSE parsers
+sh tests/review3/hook_enospc.sh          # root on Linux: patching on a full disk leaves authgui.inc untouched
 ```
 
 `tests/fixtures/` holds pfSense's upstream `authgui.inc`, `auth_check.inc` and `xmlrpc.php` (Apache-2.0). The tests use them to check that every hook anchor matches and that each patched file still parses.

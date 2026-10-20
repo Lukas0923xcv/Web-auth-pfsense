@@ -25,7 +25,8 @@ if (!defined('WEBAUTHN_KEY_FILE')) {
 	define('WEBAUTHN_KEY_FILE', '/conf/webauthn_challenge.key');
 }
 if (!defined('WEBAUTHN_USED_FILE')) {
-	define('WEBAUTHN_USED_FILE', '/var/run/webauthn_used_challenges.json');
+	/* Kept on disk: losing the list (e.g. at reboot) would make used challenges valid again. */
+	define('WEBAUTHN_USED_FILE', '/conf/webauthn_used_challenges.json');
 }
 define('WEBAUTHN_MAX_FAILURES', 5);
 define('WEBAUTHN_CHALLENGE_TTL', 300);
@@ -45,6 +46,8 @@ function webauthn_default_settings(): array {
 		'user_verification' => 'preferred',
 		/* Users without a passkey are refused unless on a trusted network. */
 		'enforce' => '',
+		/* Source addresses allowed to use XMLRPC (HA sync) while enabled. */
+		'xmlrpc_peers' => '',
 	];
 }
 
@@ -63,15 +66,33 @@ function webauthn_normalize_username(?string $username): string {
 }
 
 /*
- * Case-folded form, used only to stop case variants from skipping the
- * passkey step: LDAP and RADIUS accept "Admin" for "admin", and without
- * this "Admin" would look like a user with no passkeys.
+ * Loose form of a username, used only to stop other spellings of a
+ * remote (LDAP/RADIUS) account from skipping the passkey step. pfSense's
+ * LDAP code drops "@domain" and "\anything" from the login name, and
+ * directories match names ignoring case, width and extra spaces, so
+ * "admin@x", "ADMIN" and "ａdmin" all sign in as "admin". Without this
+ * they would look like users with no passkeys.
  */
 function webauthn_username_fold(?string $username): string {
-	return strtolower(trim((string)$username));
+	$u = explode('@', (string)$username, 2)[0];
+	$u = explode('\\', $u, 2)[0];
+	if (class_exists('Normalizer')) {
+		$n = Normalizer::normalize($u, Normalizer::FORM_KC);
+		$u = ($n === false) ? $u : $n;
+	}
+	$u = trim(preg_replace('/[\p{Z}\s]+/u', ' ', $u) ?? $u);
+	return function_exists('mb_strtolower') ? mb_strtolower($u, 'UTF-8') : strtolower($u);
 }
 
-/* Passkeys registered under a different capitalisation of $username. */
+/*
+ * Did this session sign in against pfSense's own user database? Local
+ * names are exact and case-sensitive: "Bob" and "bob" are two accounts.
+ */
+function webauthn_session_is_local(array $session): bool {
+	return in_array($session['authsource'] ?? null, ['Local Database', 'Local Database Fallback'], true);
+}
+
+/* Passkeys registered under another spelling of $username (see webauthn_username_fold()). */
 function webauthn_case_variant_credentials(string $username): array {
 	$out = [];
 	foreach (webauthn_all_credentials() as $c) {
@@ -227,14 +248,37 @@ function webauthn_session_status(array $settings, array $session, array $source)
 	}
 	$state = $session['webauthn'] ?? null;
 	if (is_array($state) && ($state['method'] ?? null) === 'webauthn' &&
-	    webauthn_normalize_username($state['user'] ?? '') === $user &&
-	    is_string($state['credential'] ?? null) &&
-	    webauthn_find_credential($user, $state['credential']) !== null) {
-		return 'verified';
+	    webauthn_normalize_username($state['user'] ?? '') === $user) {
+		if (is_string($state['credential'] ?? null) && webauthn_find_credential($user, $state['credential']) !== null) {
+			return 'verified';
+		}
+		/* Its passkey was removed: the session ends, even if the user has
+		 * no passkey left and would otherwise skip the step. */
+		return 'revoked';
 	}
-	/* A case variant with passkeys counts: it must not skip the step. */
-	$has = !empty(webauthn_get_credentials($user)) || !empty(webauthn_case_variant_credentials($user));
-	return webauthn_gate_decision($settings, $source, $has);
+	return webauthn_gate_decision($settings, $source, webauthn_session_has_credentials($session));
+}
+
+/*
+ * Does the session's user have passkeys? For remote accounts, another
+ * spelling with passkeys counts too: it must not skip the step.
+ */
+function webauthn_session_has_credentials(array $session): bool {
+	$user = webauthn_normalize_username($session['Username'] ?? '');
+	return !empty(webauthn_get_credentials($user)) ||
+	    (!webauthn_session_is_local($session) && !empty(webauthn_case_variant_credentials($user)));
+}
+
+/*
+ * May this session register a passkey? Once the account (or, for remote
+ * accounts, another spelling of it) has a passkey, only a session that
+ * signed in with one may add another. Otherwise a password alone, from a
+ * trusted network or while enforcement is off, would be enough to enrol
+ * an attacker's passkey for later use through the tunnel.
+ */
+function webauthn_may_register(array $settings, array $session, array $source): bool {
+	return !webauthn_session_has_credentials($session) ||
+	    in_array(webauthn_session_status($settings, $session, $source), ['disabled', 'verified'], true);
 }
 
 function webauthn_rp_id(?array $settings = null): string {
@@ -278,7 +322,8 @@ function webauthn_validate_settings(array $s): array {
 			    htmlspecialchars($o), htmlspecialchars($rp_id));
 		}
 	}
-	foreach (['trusted_proxies' => gettext('cloudflared source'), 'trusted_networks' => gettext('Trusted network')] as $field => $label) {
+	foreach (['trusted_proxies' => gettext('cloudflared source'), 'trusted_networks' => gettext('Trusted network'),
+	    'xmlrpc_peers' => gettext('XMLRPC peer')] as $field => $label) {
 		foreach (webauthn_split_list($s[$field] ?? '') as $c) {
 			if (!webauthn_valid_cidr($c)) {
 				$errors[] = sprintf(gettext('%1$s entry %2$s is not a valid IP address or CIDR.'), $label, htmlspecialchars($c));
@@ -293,6 +338,12 @@ function webauthn_validate_settings(array $s): array {
 		$parts = explode('/', $c, 2);
 		if (isset($parts[1]) && ctype_digit($parts[1]) && (int)$parts[1] === 0) {
 			$errors[] = gettext('A /0 trusted network would disable WebAuthn for everyone.');
+		}
+	}
+	foreach (webauthn_split_list($s['xmlrpc_peers'] ?? '') as $c) {
+		$parts = explode('/', $c, 2);
+		if (isset($parts[1]) && ctype_digit($parts[1]) && (int)$parts[1] === 0) {
+			$errors[] = gettext('A /0 XMLRPC peer would let every host use XMLRPC with a password alone.');
 		}
 	}
 	/* Without the cloudflared address, tunnel traffic from a LAN host is
@@ -405,20 +456,48 @@ function webauthn_get_sign_count(string $id): int {
 }
 
 function webauthn_set_sign_count(string $id, int $count): void {
-	$fp = @fopen(WEBAUTHN_COUNTER_FILE, 'c+');
-	if ($fp === false) {
-		return;
+	webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $count) {
+		$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
+		$data = is_array($data) ? $data : [];
+		$data[$id] = $count;
+		return webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
+	});
+}
+
+/* Run $fn holding an exclusive lock on "$file.lock"; $fail if the lock cannot be taken. */
+function webauthn_with_lock(string $file, callable $fn, $fail = false) {
+	$old = umask(077);
+	$lock = @fopen($file . '.lock', 'c');
+	umask($old);
+	if ($lock === false) {
+		return $fail;
 	}
-	flock($fp, LOCK_EX);
-	$data = json_decode(stream_get_contents($fp), true);
-	$data = is_array($data) ? $data : [];
-	$data[$id] = $count;
-	ftruncate($fp, 0);
-	rewind($fp);
-	fwrite($fp, json_encode($data));
-	flock($fp, LOCK_UN);
-	fclose($fp);
-	@chmod(WEBAUTHN_COUNTER_FILE, 0600);
+	if (!flock($lock, LOCK_EX)) {
+		fclose($lock);
+		return $fail;
+	}
+	try {
+		return $fn();
+	} finally {
+		flock($lock, LOCK_UN);
+		fclose($lock);
+	}
+}
+
+/*
+ * Replace $file with $data as JSON through a temp file and rename, so a
+ * failed write (e.g. a full disk) never leaves a truncated file behind.
+ */
+function webauthn_write_json(string $file, array $data): bool {
+	$json = json_encode($data);
+	$tmp = $file . '.tmp';
+	$old = umask(077);
+	$ok = @file_put_contents($tmp, $json) === strlen($json) && @rename($tmp, $file);
+	umask($old);
+	if (!$ok) {
+		@unlink($tmp);
+	}
+	return $ok;
 }
 
 /* Find a stored credential for $username by its base64url ID. */
@@ -444,12 +523,24 @@ function webauthn_find_credential(string $username, string $id): ?array {
  */
 function webauthn_hmac_key(): string {
 	$key = @file_get_contents(WEBAUTHN_KEY_FILE);
-	if ($key === false || strlen($key) != 32) {
-		$key = random_bytes(32);
-		$old = umask(077);
-		file_put_contents(WEBAUTHN_KEY_FILE, $key, LOCK_EX);
-		umask($old);
+	if ($key !== false && strlen($key) == 32) {
+		return $key;
 	}
+	/* Create the key through a temp file, so no request ever reads a
+	 * half-written key and replaces it. The first writer wins. */
+	$key = random_bytes(32);
+	$tmp = WEBAUTHN_KEY_FILE . '.' . getmypid() . '.tmp';
+	$old = umask(077);
+	if (@file_put_contents($tmp, $key) === 32 && !@link($tmp, WEBAUTHN_KEY_FILE)) {
+		$existing = @file_get_contents(WEBAUTHN_KEY_FILE);
+		if ($existing !== false && strlen($existing) == 32) {
+			$key = $existing;
+		} else {
+			@rename($tmp, WEBAUTHN_KEY_FILE);
+		}
+	}
+	@unlink($tmp);
+	umask($old);
 	return $key;
 }
 
@@ -494,25 +585,29 @@ function webauthn_take_challenge(string $purpose, string $username, string $clie
 	return webauthn_mark_nonce_used(bin2hex(substr($payload, 0, 16)), $expires) ? $challenge : null;
 }
 
-/* Record a nonce as used; false if it was already used. */
+/*
+ * Record a nonce as used. False if it was already used, or if that
+ * cannot be known (the list cannot be read or written).
+ */
 function webauthn_mark_nonce_used(string $nonce, int $expires): bool {
-	$fp = @fopen(WEBAUTHN_USED_FILE, 'c+');
-	if ($fp === false) {
-		return false;
-	}
-	flock($fp, LOCK_EX);
-	$used = json_decode(stream_get_contents($fp), true);
-	$used = is_array($used) ? $used : [];
-	$now = time();
-	$used = array_filter($used, function ($exp) use ($now) {
-		return $exp >= $now;
+	return webauthn_with_lock(WEBAUTHN_USED_FILE, function () use ($nonce, $expires) {
+		$now = time();
+		$raw = @file_get_contents(WEBAUTHN_USED_FILE);
+		$used = ($raw === false) ? [] : json_decode($raw, true);
+		if (!is_array($used)) {
+			/* A damaged list may hold nonces that are still valid: refuse
+			 * until every challenge it could hold has expired. */
+			clearstatcache(true, WEBAUTHN_USED_FILE);
+			if ($now - (int)@filemtime(WEBAUTHN_USED_FILE) <= WEBAUTHN_CHALLENGE_TTL) {
+				return false;
+			}
+			$used = [];
+		}
+		$used = array_filter($used, function ($exp) use ($now) {
+			return $exp >= $now;
+		});
+		$fresh = !isset($used[$nonce]);
+		$used[$nonce] = $expires;
+		return webauthn_write_json(WEBAUTHN_USED_FILE, $used) && $fresh;
 	});
-	$fresh = !isset($used[$nonce]);
-	$used[$nonce] = $expires;
-	ftruncate($fp, 0);
-	rewind($fp);
-	fwrite($fp, json_encode($used));
-	flock($fp, LOCK_UN);
-	fclose($fp);
-	return $fresh;
 }

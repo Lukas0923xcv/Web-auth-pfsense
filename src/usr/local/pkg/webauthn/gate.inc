@@ -28,6 +28,11 @@ function webauthn_gate(): void {
 		return;
 	}
 
+	if ($decision == 'revoked') {
+		webauthn_log(LOG_NOTICE, "session of user '{$user}' ended: the passkey it was verified with was removed", $source);
+		webauthn_gate_logout();
+	}
+
 	if ($decision == 'skip') {
 		$method = webauthn_source_is_trusted_network($source, $settings) ? 'trusted-network' : 'no-credential';
 		if (!is_array($state) || ($state['user'] ?? null) !== $user || ($state['method'] ?? null) !== $method) {
@@ -57,10 +62,6 @@ function webauthn_gate(): void {
 		exit;
 	}
 
-	if (is_array($state) && ($state['method'] ?? null) === 'webauthn') {
-		webauthn_log(LOG_NOTICE, "session of user '{$user}' needs a new passkey verification (its passkey was removed)", $source);
-	}
-
 	$action = $_POST['webauthn_action'] ?? '';
 	if ($action == 'cancel') {
 		webauthn_gate_logout();
@@ -75,9 +76,9 @@ function webauthn_gate(): void {
 	}
 
 	if (empty(webauthn_get_credentials($user))) {
-		/* Only a different capitalisation of this username has passkeys
-		 * (possible with LDAP/RADIUS). They belong to that exact name. */
-		webauthn_log(LOG_WARNING, "user '{$user}' has no passkey, but a differently capitalised username does; access refused", $source);
+		/* Only another spelling of this LDAP/RADIUS username (case,
+		 * "@domain", ...) has passkeys. They belong to that exact name. */
+		webauthn_log(LOG_WARNING, "user '{$user}' has no passkey, but another spelling of the username does; access refused", $source);
 		phpsession_end(true);
 		webauthn_render_gate_page('case', $settings, null, '');
 		exit;
@@ -243,7 +244,7 @@ function webauthn_render_gate_page(string $mode, array $settings, ?array $option
 							</div>
 <?php elseif ($mode == 'case'): ?>
 							<input type="hidden" name="webauthn_action" value="cancel" />
-							<p style="color:#fff"><?=gettext('The passkeys for this account are registered under a differently capitalised username. Sign out, then sign in with the username exactly as it was registered.')?></p>
+							<p style="color:#fff"><?=gettext('The passkeys for this account are registered under another spelling of the username (for example different capitals or without a @domain suffix). Sign out, then sign in with the username exactly as it was registered.')?></p>
 <?php else: ?>
 							<input type="hidden" name="webauthn_action" value="cancel" />
 							<p style="color:#fff"><?=gettext('This account has no registered passkey, and a passkey is required from this network. Register one from a trusted network first.')?></p>

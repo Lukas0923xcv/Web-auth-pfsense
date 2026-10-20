@@ -23,16 +23,9 @@ $is_admin = in_array('*', $allowedpages);
 $tab = ($is_admin && ($_REQUEST['tab'] ?? '') == 'settings') ? 'settings' : 'passkeys';
 $settings = webauthn_settings();
 $source = webauthn_request_source($_SERVER, $settings);
-/*
- * A user who already has a passkey may only add another from a session
- * verified with one (or while the second factor is off, when a password
- * already grants everything). Otherwise a password alone, from a trusted network
- * or while enforcement is off, would be enough to enrol an attacker's
- * passkey for later use through the tunnel.
- */
+/* A user who already has a passkey may only add another from a session verified with one. */
 phpsession_begin();
-$may_register = empty(webauthn_get_credentials($username)) ||
-    in_array(webauthn_session_status($settings, $_SESSION, $source), ['disabled', 'verified'], true);
+$may_register = webauthn_may_register($settings, $_SESSION, $source);
 phpsession_end();
 $input_errors = [];
 $savemsg = '';
@@ -109,6 +102,7 @@ if ($_POST['act'] == 'register') {
 		'trusted_networks' => implode(' ', webauthn_split_list($_POST['trusted_networks'])),
 		'user_verification' => (string)$_POST['user_verification'],
 		'enforce' => isset($_POST['enforce']) ? 'yes' : '',
+		'xmlrpc_peers' => implode(' ', webauthn_split_list($_POST['xmlrpc_peers'])),
 	];
 	$input_errors = webauthn_validate_settings($new);
 	if (empty($input_errors) && $new['enable'] &&
@@ -261,6 +255,10 @@ else:
 	$section->addInput(new Form_Input('trusted_networks', 'Trusted networks', 'text', $settings['trusted_networks'], ['placeholder' => '192.168.1.0/24']))
 	    ->setHelp('Space separated source networks that skip the WebAuthn step (local fallback, e.g. reaching the GUI by LAN IP). ' .
 		'Tunnel traffic is never exempt, even if cloudflared runs inside one of these networks.');
+	$section->addInput(new Form_Input('xmlrpc_peers', 'XMLRPC peers', 'text', $settings['xmlrpc_peers'], ['placeholder' => '10.10.10.2']))
+	    ->setHelp('Space separated IPs/CIDRs allowed to use XMLRPC (HA configuration sync) while WebAuthn is enabled, ' .
+		'in addition to the trusted networks. Enter the HA partner\'s sync interface address. XMLRPC authenticates ' .
+		'with a password only, so it is refused from every other host.');
 	$form->add($section);
 	print $form;
 

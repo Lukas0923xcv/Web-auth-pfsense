@@ -284,10 +284,11 @@ unlink($state);
 /* F0 / D1 decision checks.                                             */
 /* ------------------------------------------------------------------ */
 
-check(webauthn_xmlrpc_refused(webauthn_request_source($tunnel, $settings)), 'F0: XMLRPC via cloudflared refused');
-check(webauthn_xmlrpc_refused(webauthn_request_source(['REMOTE_ADDR' => '192.168.1.99', 'HTTP_X_FORWARDED_FOR' => '1.2.3.4'],
-    array_merge($settings, ['trusted_proxies' => '']))), 'F0: XMLRPC with proxy headers refused even without cloudflared source');
-check(!webauthn_xmlrpc_refused(webauthn_request_source(['REMOTE_ADDR' => '192.168.1.2'], $settings)), 'F0: direct HA peer allowed');
+check(webauthn_xmlrpc_refused(webauthn_request_source($tunnel, $settings), $settings), 'F0: XMLRPC via cloudflared refused');
+$noproxy = array_merge($settings, ['trusted_proxies' => '']);
+check(webauthn_xmlrpc_refused(webauthn_request_source(['REMOTE_ADDR' => '192.168.1.99', 'HTTP_X_FORWARDED_FOR' => '1.2.3.4'], $noproxy),
+    $noproxy), 'F0: XMLRPC with proxy headers refused even without cloudflared source');
+check(!webauthn_xmlrpc_refused(webauthn_request_source(['REMOTE_ADDR' => '192.168.1.2'], $settings), $settings), 'F0: direct HA peer allowed');
 $x = webauthn_hook_apply(file_get_contents(__DIR__ . '/fixtures/xmlrpc.php'), 'xmlrpc');
 check(strpos((string)$x, WEBAUTHN_HOOK_BEGIN) < strpos((string)$x, 'class pfsense_xmlrpc_server'), 'F0: guard runs before the XMLRPC server');
 
