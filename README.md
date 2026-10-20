@@ -19,8 +19,8 @@ Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, s
 From a pfSense shell (console option 8, SSH), or as one line joined with `&&` in **Diagnostics > Command Prompt**. Running the same command again updates an existing install and keeps settings and passkeys:
 
 ```sh
-cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/Web-auth-pfsense/tar.gz/refs/heads/claude/vigilant-cray-p2utgq
-rm -rf Web-auth-pfsense-* && tar xzf webauthn.tar.gz && cd Web-auth-pfsense-* && sh install.sh
+cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/refs/heads/claude/vigilant-cray-p2utgq
+rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
 
 The installer copies the files, lint-checks them, patches `authgui.inc` (keeping a copy at `authgui.inc.webauthn-orig`), and adds **System > WebAuthn Passkeys** to the menu. The second factor stays **disabled** until you turn it on.
