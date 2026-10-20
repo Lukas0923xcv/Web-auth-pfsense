@@ -155,7 +155,7 @@ Errors inside the gate fail closed: the page does not load.
 php tests/run.php                        # verifier, CBOR, policy, settings validation, authgui hook (79 checks)
 php tests/gate_test.php                  # end-to-end gate requests with a software authenticator (14 checks)
 php tests/audit_test.php                 # security audit regressions F1-F7, incl. the real patched auth_check.inc (50 checks)
-php tests/review3/review3_test.php       # third review: username spellings, revocation, XMLRPC peers, nonce list (34 checks)
+php tests/review3/review3_test.php       # third review: username spellings, revocation, XMLRPC peers, nonce list (44 checks)
 php tests/review3/gate_ldap_variant.php  # third review, end to end through the gate (5 checks)
 php tests/review3/fuzz_parsers.php       # mutation fuzz of the CBOR / authenticator data / COSE parsers
 sh tests/review3/hook_enospc.sh          # root on Linux: patching on a full disk leaves authgui.inc untouched
