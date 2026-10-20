@@ -102,8 +102,13 @@ check($r['destroyed'], 'session destroyed after repeated failures');
 setup($state, $settings);
 $r = req($state, ['server' => ['REMOTE_ADDR' => '192.168.1.20', 'HTTP_HOST' => '192.168.1.1']]);
 check($r['returned'] && ($r['webauthn']['method'] ?? null) === 'trusted-network', 'LAN by IP skips');
+$st = unserialize(file_get_contents($state));
+$st['session']['page-match'] = ['*'];
+file_put_contents($state, serialize($st));
 $r = req($state, ['server' => $tunnel]);
 check(!$r['returned'], 'same session via tunnel must verify');
+$st = unserialize(file_get_contents($state));
+check(!isset($st['session']['page-match']), 'cached page privileges dropped until verified (auth_check.inc)');
 
 /* Host rewritten by cloudflared: the challenge is still offered; the
  * browser checks its own origin against the list sent with it. */

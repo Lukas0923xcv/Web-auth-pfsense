@@ -65,6 +65,7 @@ if ($_POST['act'] == 'register') {
 			/* Holding a passkey just proven to the server satisfies the gate. */
 			$_SESSION['webauthn'] = ['user' => $username, 'method' => 'webauthn', 'time' => time()];
 			webauthn_log(LOG_NOTICE, "user '{$username}' registered passkey '{$name}'", $source);
+			webauthn_notice(sprintf('Passkey "%s" was registered for user %s from %s.', $name, $username, $source['client']));
 			phpsession_end(true);
 			/* Redirect so a reload does not resubmit the used challenge. */
 			header('Location: system_webauthn.php?registered=' . urlencode($name));
@@ -79,6 +80,7 @@ if ($_POST['act'] == 'register') {
 	$id = (string)$_POST['id'];
 	if (webauthn_delete_credential($id, $is_admin ? null : $username)) {
 		webauthn_log(LOG_NOTICE, "user '{$username}' removed passkey {$id}", $source);
+		webauthn_notice(sprintf('A passkey was removed by user %s from %s.', $username, $source['client']));
 		header('Location: system_webauthn.php?removed=1');
 		exit;
 	} else {
@@ -105,6 +107,10 @@ if ($_POST['act'] == 'register') {
 		$settings = webauthn_settings();
 		$source = webauthn_request_source($_SERVER, $settings);
 		$savemsg = gettext('Settings saved.');
+		webauthn_log(LOG_NOTICE, "user '{$username}' changed WebAuthn settings (enable=" . ($new['enable'] ? 'yes' : 'no') .
+		    ", enforce=" . ($new['enforce'] ? 'yes' : 'no') . ")", $source);
+		webauthn_notice(sprintf('WebAuthn settings were changed by user %s from %s (enabled: %s, enforced: %s).',
+		    $username, $source['client'], $new['enable'] ? 'yes' : 'no', $new['enforce'] ? 'yes' : 'no'));
 	} else {
 		$settings = array_merge($settings, $new);
 	}

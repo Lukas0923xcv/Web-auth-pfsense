@@ -25,7 +25,7 @@ if (!defined('WEBAUTHN_KEY_FILE')) {
 	define('WEBAUTHN_KEY_FILE', '/conf/webauthn_challenge.key');
 }
 if (!defined('WEBAUTHN_USED_FILE')) {
-	define('WEBAUTHN_USED_FILE', '/tmp/webauthn_used_challenges.json');
+	define('WEBAUTHN_USED_FILE', '/var/run/webauthn_used_challenges.json');
 }
 define('WEBAUTHN_MAX_FAILURES', 5);
 define('WEBAUTHN_CHALLENGE_TTL', 300);
@@ -251,6 +251,19 @@ function webauthn_log(int $level, string $message, ?array $source = null): void 
 	}
 	$message = preg_replace('/[\x00-\x1f\x7f]/', ' ', $message);
 	syslog(LOG_USER | $level, 'webauthn: ' . $message);
+}
+
+/*
+ * Raise a GUI notice (the bell icon; also sent through any configured
+ * notification channels such as e-mail) for security-relevant events.
+ */
+function webauthn_notice(string $message): void {
+	if (!function_exists('file_notice')) {
+		@include_once('notices.inc');
+	}
+	if (function_exists('file_notice')) {
+		file_notice('webauthn', $message, 'WebAuthn');
+	}
 }
 
 /* ---- Credential storage ---- */

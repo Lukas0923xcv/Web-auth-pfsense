@@ -117,11 +117,33 @@ Recovery, if every passkey is lost: log in from a trusted network and register a
 
 Users with the `page-all` privilege (admins) manage everyone's passkeys and the settings. Other users can register and remove only their own passkeys, if they are granted access to `system_webauthn.php`.
 
+## Security notes and limits
+
+**What is covered:** every web GUI page. That includes the lightweight status endpoints such as `getstats.php`, which use `auth_check.inc`: their cached page privileges are dropped until the session passes WebAuthn. Passkey registrations and removals, settings changes, and 5 failed passkey attempts after a correct password each raise a GUI notice. The notice is also sent by e-mail or another notification channel, if you have one configured.
+
+**What is not covered:**
+- `/xmlrpc.php` (password only). Block it on the tunnel, as shown above.
+- SSH and the console.
+- Other services (VPN and similar).
+- Add-on packages with their own authentication, such as a REST API package.
+
+**When the second factor silently switches off (fail-open):**
+- **The hook is missing.** This happens after a pfSense upgrade, until the boot script re-applies it, or if pfSense ever changes the code the hook is anchored to. Run `/usr/local/pkg/webauthn/hook.php status` after upgrades.
+- **The settings are gone.** This happens when you restore a config backup taken before WebAuthn was enabled. The Passkeys tab then shows "disabled".
+
+Errors inside the gate fail closed: the page does not load.
+
+**Trusted networks** skip the passkey entirely, and anyone in them can register a passkey once they know a password. Keep the list as narrow as possible: your admin PC's address, or a management VLAN, rather than a whole LAN with guests and IoT devices.
+
+**User verification:** *Required* makes the authenticator ask for a PIN or biometric on every use. Choose it if your authenticators support it.
+
+**Updates run as root on your firewall.** Pin the download to a commit you have reviewed (`.../tar.gz/<commit-sha>`) instead of a branch. Protect the GitHub account that hosts the code with 2FA.
+
 ## Tests
 
 ```sh
 php tests/run.php        # verifier, CBOR, policy, settings validation, authgui hook (79 checks)
-php tests/gate_test.php  # end-to-end gate requests with a software authenticator (13 checks)
+php tests/gate_test.php  # end-to-end gate requests with a software authenticator (14 checks)
 ```
 
 `tests/fixtures/authgui.inc` is pfSense's upstream file (Apache-2.0), used to check that the hook anchor matches.

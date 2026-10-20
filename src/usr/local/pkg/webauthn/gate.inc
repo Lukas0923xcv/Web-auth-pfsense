@@ -42,8 +42,14 @@ function webauthn_gate(): void {
 		return;
 	}
 
-	/* The session is password-authenticated but not yet WebAuthn-verified. */
-	unset($_SESSION['webauthn']);
+	/*
+	 * The session is password-authenticated but not yet WebAuthn-verified.
+	 * Also drop pfSense's cached page privileges: auth_check.inc (used by
+	 * getstats.php, ifstats.php and similar) trusts 'page-match' without
+	 * going through authgui.inc, so a session that was exempted on a
+	 * trusted network must not keep it when it is used from elsewhere.
+	 */
+	unset($_SESSION['webauthn'], $_SESSION['page-match']);
 
 	if (isAjax()) {
 		phpsession_end(true);
@@ -81,6 +87,8 @@ function webauthn_gate(): void {
 		webauthn_log(LOG_WARNING, "passkey verification failed for user '{$user}' ({$failures}/" . WEBAUTHN_MAX_FAILURES . "): {$result}", $source);
 		if ($failures >= WEBAUTHN_MAX_FAILURES) {
 			webauthn_log(LOG_WARNING, "too many passkey failures for user '{$user}'; session ended", $source);
+			webauthn_notice(sprintf('%d failed passkey attempts for user %s from %s after a correct password. ' .
+			    'If this was not you, change the password.', $failures, $user, $source['client']));
 			webauthn_gate_logout();
 		}
 		$error = gettext('Passkey verification failed. Try again.');
