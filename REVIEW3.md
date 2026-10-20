@@ -21,7 +21,7 @@ All findings below are fixed in the commit that adds this file, except where not
 
 | Finding | Fix |
 |---|---|
-| R1 LDAP spellings skip the passkey | `webauthn_username_fold()` drops `@…`/`\…`, applies NFKC, collapses spaces and lower-cases (UTF-8). Another spelling with passkeys counts as "has passkeys" for remote (non-local) sessions. |
+| R1 LDAP spellings skip the passkey | `webauthn_username_keys()` lists the accounts a backend may take a name to mean: the part before `@`, both sides of `\` (pfSense's LDAP keeps the left, RADIUS the right), the part after `/`, compared after NFKC, removal of ignorable characters (RFC 4518), space collapsing and case folding. Another spelling with passkeys counts as "has passkeys" for remote (non-local) sessions. Users of one domain (`alice@corp`, `bob@corp`) do not match each other. |
 | R2 removing the last passkey does not revoke | New status `revoked`: the gate signs the session out, and `auth_check.inc` ignores its cached privileges. |
 | R3 empty `authgui.inc` on a full disk | `replace_file()` writes a per-process temp file, checks the write, fsyncs, reads it back, lints, then renames. Uninstall uses the same path. |
 | R4 enrolment through another spelling | `webauthn_may_register()` uses the same "has passkeys" rule as the gate. |

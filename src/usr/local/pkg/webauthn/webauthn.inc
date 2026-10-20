@@ -66,22 +66,52 @@ function webauthn_normalize_username(?string $username): string {
 }
 
 /*
- * Loose form of a username, used only to stop other spellings of a
- * remote (LDAP/RADIUS) account from skipping the passkey step. pfSense's
- * LDAP code drops "@domain" and "\anything" from the login name, and
- * directories match names ignoring case, width and extra spaces, so
- * "admin@x", "ADMIN" and "ａdmin" all sign in as "admin". Without this
- * they would look like users with no passkeys.
+ * A username the way directories compare names (RFC 4518): compatibility
+ * forms (NFKC), no soft hyphens, zero-width or other ignorable characters,
+ * runs of spaces collapsed, case folded.
  */
 function webauthn_username_fold(?string $username): string {
-	$u = explode('@', (string)$username, 2)[0];
-	$u = explode('\\', $u, 2)[0];
+	$u = (string)$username;
 	if (class_exists('Normalizer')) {
 		$n = Normalizer::normalize($u, Normalizer::FORM_KC);
 		$u = ($n === false) ? $u : $n;
 	}
+	$u = preg_replace('/[\p{Cf}\p{Cc}\x{034F}\x{1806}\x{180B}-\x{180D}\x{FE00}-\x{FE0F}\x{FFFC}]/u', '', $u) ?? $u;
 	$u = trim(preg_replace('/[\p{Z}\s]+/u', ' ', $u) ?? $u);
-	return function_exists('mb_strtolower') ? mb_strtolower($u, 'UTF-8') : strtolower($u);
+	return function_exists('mb_convert_case') ? mb_convert_case($u, MB_CASE_FOLD, 'UTF-8') : strtolower($u);
+}
+
+/*
+ * The account names an authentication backend may take $username to
+ * mean, used only to stop other spellings of a remote (LDAP/RADIUS)
+ * account from skipping the passkey step. pfSense's LDAP code keeps the
+ * part before "@" and before "\"; RADIUS servers usually strip a realm
+ * ("user@realm", "REALM\user", "realm/user"). So "admin@x", "admin\x",
+ * "CORP\admin" and "ADMIN" can all sign in as "admin".
+ *
+ * $login: the name typed at sign-in. Only for it is the part before "\"
+ * a candidate (pfSense's LDAP quirk); for a stored passkey owner it is
+ * just a domain, and two users of one domain must not match each other.
+ */
+function webauthn_username_keys(?string $username, bool $login): array {
+	$u = webauthn_username_fold($username);
+	$parts = [$u];
+	if (str_contains($u, '\\')) {
+		[$before, $after] = explode('\\', $u, 2);
+		$parts[] = $after;
+		if ($login) {
+			$parts[] = $before;
+		}
+	}
+	if (str_contains($u, '/')) {
+		$parts[] = substr($u, strrpos($u, '/') + 1);
+	}
+	$keys = [];
+	foreach ($parts as $p) {
+		$keys[] = trim($p);
+		$keys[] = trim(explode('@', $p, 2)[0]);
+	}
+	return array_values(array_unique(array_filter($keys, 'strlen')));
 }
 
 /*
@@ -92,13 +122,14 @@ function webauthn_session_is_local(array $session): bool {
 	return in_array($session['authsource'] ?? null, ['Local Database', 'Local Database Fallback'], true);
 }
 
-/* Passkeys registered under another spelling of $username (see webauthn_username_fold()). */
+/* Passkeys registered under another spelling of the sign-in name $username (see webauthn_username_keys()). */
 function webauthn_case_variant_credentials(string $username): array {
 	$out = [];
+	$mine = webauthn_username_keys($username, true);
 	foreach (webauthn_all_credentials() as $c) {
 		$name = webauthn_normalize_username($c['username'] ?? '');
 		if ($name !== webauthn_normalize_username($username) &&
-		    webauthn_username_fold($name) === webauthn_username_fold($username)) {
+		    !empty(array_intersect(webauthn_username_keys($name, false), $mine))) {
 			$out[] = $c;
 		}
 	}

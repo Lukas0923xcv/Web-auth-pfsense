@@ -85,12 +85,21 @@ function reset_config(array $settings, array $users): void {
  * stays "admin@x". It must not skip the passkey step of "admin".
  */
 reset_config($settings, ['admin']);
-foreach (['admin@x', 'admin\\x', "admin\u{00A0}", "\u{FF41}dmin", 'ADMIN@corp', 'Admin'] as $variant) {
+foreach (['admin@x', 'admin\\x', "admin\u{00A0}", "\u{FF41}dmin", 'ADMIN@corp', 'Admin',
+    "ad\u{00AD}min", "ad\u{200B}min", "admin\u{FE0F}", 'CORP\\admin', 'corp/admin', 'CORP\\Admin@corp'] as $variant) {
 	$st = webauthn_session_status($settings, ['Username' => $variant] + $ldap, $tunnel);
-	check($st === 'require', 'R1 LDAP spelling ' . json_encode($variant) . " of 'admin' must not skip the passkey step (got $st)");
+	check($st === 'require', 'R1 LDAP/RADIUS spelling ' . json_encode($variant) . " of 'admin' must not skip the passkey step (got $st)");
 }
 check(webauthn_session_status($settings, ['Username' => 'carol'] + $ldap, $tunnel) === 'skip',
     'R1 an unrelated LDAP user without passkeys still skips while Enforce is off');
+/* Two users of one domain are not spellings of each other. */
+reset_config($settings, ['alice@corp', 'CORP\\alice']);
+foreach (['bob@corp', 'CORP\\bob', 'corp'] as $other) {
+	$st = webauthn_session_status($settings, ['Username' => $other] + $ldap, $tunnel);
+	check($st === 'skip', "R1 '$other' is not taken for alice (got $st)");
+}
+check(webauthn_session_status($settings, ['Username' => 'alice'] + $ldap, $tunnel) === 'require', "R1 'alice' is a spelling of 'alice@corp'");
+reset_config($settings, ['admin']);
 check(webauthn_session_status($settings, ['Username' => 'admin'] + $ldap, $tunnel) === 'require', 'R1 the exact name still requires');
 
 /*

@@ -84,8 +84,11 @@ function hook_failed(string $target, string $why): void {
 	@touch($flag);
 	@include_once('notices.inc');
 	if (function_exists('file_notice')) {
+		/* At boot (earlyshellcmd) the network is not up yet: sending e-mail
+		 * would only stall the boot, so keep the notice local then. */
+		$booting = function_exists('is_platform_booting') && is_platform_booting();
 		file_notice('webauthn', "Could not patch {$file} ({$why}). The WebAuthn second factor is NOT fully active. " .
-		    'Run /usr/local/pkg/webauthn/hook.php status from a shell.', 'WebAuthn');
+		    'Run /usr/local/pkg/webauthn/hook.php status from a shell.', 'WebAuthn', '', 1, $booting);
 	}
 }
 
