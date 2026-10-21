@@ -1,175 +1,82 @@
 # pfSense WebAuthn second factor
 
-Adds a passkey / security-key (WebAuthn) step after the normal username and password login on the pfSense web GUI.
+Adds a passkey / security-key (WebAuthn) step after the normal password login on the pfSense web GUI. Target: pfSense CE 2.8.1. Built for access through a Cloudflare Tunnel, but it also works on the LAN.
 
-Target: pfSense CE 2.8.1. The hook anchors on the `session_auth()` block in `/etc/inc/authgui.inc`, which has kept the same shape for years. The installer refuses to patch, and says so, if that block is missing.
+## Install / update
 
-## How it works
-
-1. The password login is unchanged (`session_auth()`).
-2. Immediately after it, and before pfSense checks page privileges, `webauthn_gate()` runs on every GUI request. If the session has not yet passed WebAuthn, the gate shows a "Use passkey" page instead of the requested page.
-3. The browser signs a single-use challenge: a random nonce with a 5-minute lifetime, HMAC-bound to the session, the user, and the purpose. Challenges are not stored in the session, so loading the page again does not invalidate one already in use. The server verifies the RP ID hash, the origin, the user-presence flag (and user verification if required), the signature, and the signature counter (advanced atomically, so a cloned authenticator racing the real one is caught). A challenge counts as used only once its response verified, so failed attempts cannot fill the list of used challenges. On success it regenerates the session ID and lets the request through.
-4. The verification belongs to that one login: it is bound to the session ID, which pfSense renews at every password sign-in, so signing in again (or a login POST into the session) requires the passkey again. It also expires after **12 hours**, and is dropped when the RP ID changes or user verification becomes *Required* while it was made without.
-
-Supported algorithms: ES256, RS256, and Ed25519 (when PHP's sodium extension is present). These cover current platform passkeys (iCloud Keychain, Google Password Manager, Windows Hello) and hardware keys (YubiKey and others). Attestation is not requested (`attestation: "none"`).
-
-Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, so they are included in config backups. Signature counters, the list of used challenges, the list of removed passkey IDs and the notice rate limit are kept in `/conf` (`webauthn_signcount.json`, `webauthn_used_challenges.json`, `webauthn_revoked.json`, `webauthn_notices.json`) so that a login does not create a new config revision. Changes to passkeys and settings are made under a lock on the configuration as it is on disk at that moment, so two parallel requests cannot undo each other's changes. Other pfSense pages save the whole configuration as it was when their request started and could still undo a passkey or settings change made at the same moment; that cannot be prevented from the add-on, but it is not silent: the next GUI request that sees the package's settings or passkeys differ from what the package last saved raises a notice (a config restore does the same). If `webauthn_revoked.json` or `webauthn_signcount.json` is ever damaged, no passkey is accepted until it is repaired or removed (fail closed; the system log says so).
-
-## Install
-
-From a pfSense shell (console option 8, SSH), or as one line joined with `&&` in **Diagnostics > Command Prompt**. Running the same command again updates an existing install and keeps settings and passkeys.
-
-Install a commit you have reviewed, not a branch: replace `<commit-sha>` with the full commit ID from the repository's commit list (GitHub: **Commits**, copy the full SHA).
+Run on the pfSense (console option 8, SSH, or one line joined with `&&` in **Diagnostics > Command Prompt**). The same command updates an existing install and keeps your settings and passkeys.
 
 ```sh
-cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/<commit-sha>
+cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/refs/heads/claude/vigilant-cray-p2utgq
 rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
 
-Updating from an earlier version signs every session out of the passkey step once: older verifications carry no session binding and are not trusted.
+Then check that everything is in place (all five lines must say `present`):
 
-The installer copies the files, lint-checks them, patches `/etc/inc/authgui.inc`, `/etc/inc/auth_check.inc` and `/usr/local/www/xmlrpc.php` (keeping copies with the suffix `.webauthn.orig`, which pfSense's web server refuses to serve), adds **System > WebAuthn Passkeys** to the menu, and registers the boot command and cron job that re-apply the patches. The second factor stays **disabled** until you turn it on.
-
-- Check the hooks: `/usr/local/pkg/webauthn/hook.php status`. It prints one line per file (`present`, `OUTDATED`: re-run the installer, or `MISSING`), plus whether the cron job and the boot command are in place.
-- Uninstall: `sh uninstall.sh`. Passkeys and settings stay in `config.xml`.
-- Upgrades: a pfSense upgrade replaces the patched files. The hooks are re-applied early at every boot, before the GUI starts, by an `earlyshellcmd` entry in config.xml (this also runs on the first boot after an upgrade or a config restore, when package start scripts are skipped), by `/usr/local/etc/rc.d/webauthn_hook.sh`, and every 5 minutes by a cron job stored in config.xml (System > Cron if the Cron package is installed). Still, run `hook.php status` after upgrading. If pfSense ever changes the code a hook is anchored to, or a patched file cannot be written (for example on a full disk), that hook is **not** applied and the original file is left untouched. The installer exits with an error, `webauthn: could not patch <file>` is logged, and a GUI notice (also e-mailed, if configured) is raised once per boot.
-- The hooks load the package files unconditionally. If the files are removed without running the uninstaller, the GUI stops working (fail closed) rather than skipping the passkey step.
-
-## Access path: Cloudflare Tunnel + Cloudflare Access
-
-Example layout: the GUI is published as `https://pfsense.example.com` through cloudflared, behind Cloudflare Access.
-
-### Origin and RP ID come from the public hostname
-
-TLS terminates at Cloudflare. cloudflared may reach pfSense over plain HTTP, or over HTTPS with an untrusted certificate. So the gate **never** uses `$_SERVER['HTTPS']`, the local scheme, or the port to decide anything. Instead:
-
-- **RP ID** (setting): `pfsense.example.com`, or the parent domain `example.com` (see [Local fallback](#local-fallback)).
-- **Allowed origins** (setting): defaults to `https://<RP ID>`. Set it to `https://pfsense.example.com`, plus any LAN hostname.
-
-The browser reports the origin it actually used in `clientDataJSON`, and that origin is checked against this list. A request that reaches pfSense as plain HTTP from the tunnel is accepted, as long as the browser was on an allowed `https://` origin.
-
-Settings validation rejects origins that are not `https://`, origins whose host is not the RP ID or a subdomain of it, and IP addresses as the RP ID.
-
-### Client IP and GUI lockout
-
-pfSense sees cloudflared's address, not the user's. Configure **cloudflared source** with that address:
-
-- `127.0.0.1` (and `::1`) if cloudflared runs on pfSense itself
-- the host's LAN IP if it runs elsewhere
-
-The **This request** panel on the Settings tab shows what pfSense sees, which helps you find it.
-
-- `CF-Connecting-IP` is read **only** when the TCP peer matches a configured cloudflared source. From any other peer the header is ignored, because anyone could forge it. The trusted value is used for logging, for example: `webauthn: passkey verification failed for user 'admin' (1/5): Signature verification failed from 203.0.113.9 (via cloudflared 127.0.0.1)`.
-- WebAuthn events are logged with the **USER** facility, under Status > System Logs > System > General (search for `webauthn`). They never use the `webConfigurator authentication error ... from:` format that sshguard watches. A failed passkey therefore never puts cloudflared's address into the lockout table, which would lock out every tunnel user. Repeated failures are limited per session instead: after 5 failures the session is destroyed and the password must be entered again.
-- **Password** failures are still logged by pfSense itself, in sshguard's format, with cloudflared's address. That **would** lock out everyone. Add the cloudflared address to **System > Advanced > Admin Access > Login Protection > Pass list**. Cloudflare Access is then your brute-force protection in front of the password.
-
-### DNS rebind and HTTP_REFERER checks
-
-pfSense rejects requests whose `Host` header, or `Referer` host, it does not recognise. Under **System > Advanced > Admin Access > Alternate Hostnames**, add:
-
-```
-pfsense.example.com
+```sh
+/usr/local/pkg/webauthn/hook.php status
 ```
 
-Also add any LAN hostname you use, e.g. `pfsense.lan.example.com`. Without this you get "Potential DNS Rebind attack detected" or "An HTTP_REFERER was detected other than what is defined". The Settings tab warns about any allowed-origin host that is missing from this list.
+The second factor stays **off** until you enable it in **System > WebAuthn Passkeys > Settings**. After an update every session has to confirm with its passkey once.
 
-Depending on the ingress configuration, cloudflared may send pfSense the origin service address (for example `127.0.0.1`) as `Host` instead of the public hostname. The browser still sends the public hostname as `Referer`, so it must be in Alternate Hostnames either way. The package never relies on `Host`: the browser checks its own origin against the allowed list before starting a ceremony, and the server checks the origin in `clientDataJSON`.
+The installer runs as root. To install a version you have reviewed, replace `refs/heads/claude/vigilant-cray-p2utgq` with a full commit ID.
 
-### cloudflared ingress tips
+## Remove
+
+```sh
+cd /root/web-auth-pfsense-* && sh uninstall.sh
+```
+
+Without the downloaded folder, the same steps by hand:
+
+```sh
+/usr/local/bin/php -f /usr/local/pkg/webauthn/hook.php uninstall
+rm -f /usr/local/etc/rc.d/webauthn_hook.sh /usr/local/www/system_webauthn.php
+rm -rf /usr/local/pkg/webauthn /usr/local/www/webauthn
+```
+
+Passkeys and settings stay in `config.xml`; the counters and lists in `/conf/webauthn_*` stay too (delete them only if you do not plan to reinstall).
+
+## Setup (in this order, to avoid locking yourself out)
+
+1. Install. Then, in pfSense:
+   - **System > Advanced > Admin Access > Alternate Hostnames**: add your public hostname (e.g. `pfsense.example.com`) and any LAN hostname.
+   - **Login Protection > Pass list**: add the address cloudflared connects from, or one wrong password locks out every tunnel user.
+2. **System > WebAuthn Passkeys > Settings**: set the RP ID (public hostname, or its parent domain), the allowed origins, the **cloudflared source** (`127.0.0.1` if cloudflared runs on pfSense, else its LAN IP) and, if you use it, the trusted networks. Leave **Enforce** off and enable.
+3. Open the GUI on an allowed hostname, **Passkeys > Register passkey**. Register at least two authenticators.
+4. Turn **Enforce** on: users without a passkey are then refused (except from trusted networks). **With LDAP or RADIUS, always turn Enforce on**, because a directory can accept other spellings of a username than the one a passkey was registered for.
+
+If you use **HA**, enter the partner's sync address under **XMLRPC peers** (on both nodes) before enabling, or configuration sync stops.
+
+## Cloudflare Tunnel
+
+Passkeys need the public hostname, not an IP. The origin and RP ID come from the hostname the browser used, never from how cloudflared reaches pfSense. Block XMLRPC and php-fpm's status page on the tunnel:
 
 ```yaml
 ingress:
   - hostname: pfsense.example.com
-    path: (?i)xmlrpc             # unanchored: also matches //xmlrpc.php, /./xmlrpc.php, /XMLRPC.php
-    service: http_status:404     # XMLRPC uses HTTP basic auth (password only); never expose it
+    path: (?i)xmlrpc
+    service: http_status:404
   - hostname: pfsense.example.com
-    path: (?i)^[/.]*status/?$    # php-fpm status page; see below
+    path: (?i)^[/.]*status/?$
     service: http_status:404
   - hostname: pfsense.example.com
     service: https://127.0.0.1:443
     originRequest:
-      noTLSVerify: true          # pfSense's self-signed GUI certificate
+      noTLSVerify: true
   - service: http_status:404
 ```
 
-`/xmlrpc.php` (HA sync) authenticates with a password over HTTP basic auth and does not go through the GUI login, so the WebAuthn step cannot protect it, and its methods include running shell commands. The package therefore refuses XMLRPC requests that arrive from a cloudflared source address or carry proxy headers, whether or not the second factor is enabled. While the second factor is enabled, XMLRPC is also refused from every host that is neither on a trusted network nor listed under **XMLRPC peers** (Settings tab). **If you use HA, enter the partner's sync interface address there before enabling**, on both nodes, or configuration sync stops (refusals are logged as `webauthn: refused XMLRPC request`). Block it on the tunnel as well, with the **unanchored** rule shown above: an anchored `^/xmlrpc\.php` rule misses paths such as `//xmlrpc.php`, which pfSense's web server still serves.
+## Trusted networks and recovery
 
-`/status` is php-fpm's status page. pfSense's web server serves it only to `127.0.0.1`, without a GUI login. When cloudflared runs on pfSense itself, every tunnel request comes from `127.0.0.1`, so anyone past Cloudflare Access could read it (it lists the URLs of requests in progress). The `status` rule above blocks it; running cloudflared on a separate host avoids the problem entirely.
+- **Trusted networks** skip the passkey (e.g. a management VLAN). Keep them narrow: an admin session there is effectively root. Tunnel traffic is never exempt, even if cloudflared sits inside one.
+- To use passkeys on the LAN too, set the RP ID to the parent domain (`example.com`) and list both hostnames as allowed origins; the LAN hostname needs trusted HTTPS.
+- **All passkeys lost:** an admin logs in from a trusted network, removes the lost passkeys and registers a new one. Without a trusted network, run `/usr/local/pkg/webauthn/hook.php uninstall` on the console.
 
-If the GUI runs over plain HTTP, pfSense does not set the `Secure` flag on its session cookie. The browser still talks HTTPS to Cloudflare, but keeping the GUI on HTTPS (with `noTLSVerify`) is preferable.
+## Good to know
 
-## Local fallback
-
-Passkeys are bound to a domain name. They cannot work when you open the GUI by IP address (`https://192.168.1.1`). There are two options, and they can be combined:
-
-1. **Trusted networks** (setting): source networks, e.g. `192.168.1.0/24`, that skip the WebAuthn step. They can only be saved once the **cloudflared source** is set. Traffic from a cloudflared source address, or any request carrying Cloudflare or proxy headers (`CF-Connecting-IP`, `X-Forwarded-For`, `Forwarded`, `X-Real-IP`), is **never** exempt. This holds even when cloudflared itself sits inside a trusted network (on the LAN, or on pfSense at 127.0.0.1). Otherwise every Internet user would inherit the LAN's exemption.
-2. **Parent-domain RP ID**: set the RP ID to `example.com` and the allowed origins to:
-   ```
-   https://pfsense.example.com
-   https://pfsense.lan.example.com
-   ```
-   One passkey then works on both hostnames. The LAN hostname needs:
-   - local DNS pointing it at pfSense (DNS Resolver host override)
-   - HTTPS with a certificate the browser trusts (for example from the ACME package with a DNS-01 challenge), because browsers only offer WebAuthn on secure origins
-   - an entry in Alternate Hostnames
-
-   Changing the RP ID invalidates passkeys registered under the old one. The passkey list marks them as not matching.
-
-When you reach the GUI by an IP or another unlisted name from outside a trusted network, the gate explains that passkeys need one of the configured hostnames, and links to them.
-
-## Setup order (avoid locking yourself out)
-
-1. Install the package, then set the Alternate Hostnames and the Login Protection pass list.
-2. Under **System > WebAuthn Passkeys > Settings**, set the RP ID, the allowed origins, the cloudflared source, the trusted networks and, with HA, the XMLRPC peers (on both nodes). Leave **Enforce** off, then enable.
-3. Open the GUI on an allowed hostname, then **Passkeys > Register passkey**. Register at least two authenticators.
-4. Turn on **Enforce**. Users without a passkey are then refused, except from trusted networks. The settings page refuses to save a change that would lock out the session making it.
-
-Once a user has a passkey, adding another requires a session that signed in **with** a passkey. A password alone, even from a trusted network, cannot enrol an extra passkey. While the second factor is disabled nobody signs in with a passkey, so then only an admin can add a further passkey to an account that has one; the first passkey of an account always needs only the password. Users other than admins cannot remove their **last usable** passkey (one for the current RP ID) without a passkey-verified session; this is decided under the configuration lock, so parallel removals cannot get around it. An account can hold at most 20 passkeys. Each account can complete at most 50 passkey ceremonies in 5 minutes, so one account cannot exhaust the list of used challenges for everyone else.
-
-Removing a passkey signs out the sessions it verified at their next request, even when it was the user's last passkey. Its ID is also recorded as revoked in `/conf/webauthn_revoked.json`: it is never accepted again, even if a config restore or a parallel change brings the record back. That list lives outside config.xml, so it is not in config backups: after reinstalling pfSense and restoring a backup taken before a passkey was removed, remove that passkey again. Passkeys registered by a local account remember the account's uid; if the account is deleted and a new one is created with the same name, the old passkeys do not count for it and are shown as "belongs to a deleted account" (passkeys registered before this version, and passkeys of LDAP/RADIUS accounts, have no uid and are bound to the name only).
-
-Recovery, if every passkey is lost: an admin logs in from a trusted network, removes the lost passkeys, then registers a new one. Users other than admins ask an admin. Without a trusted network, run `/usr/local/pkg/webauthn/hook.php uninstall` from the console.
-
-Passkeys belong to the **exact** username, because pfSense local accounts are case-sensitive: `Bob` and `bob` can be two different people, and each is treated on its own. LDAP and RADIUS accept other spellings for the same person: a different capitalisation, a `@domain` or `\suffix` (pfSense's LDAP code drops both), a RADIUS realm (`CORP\admin`, `corp/admin`), `user%realm`, or full-width, katakana/hiragana, extra-space and invisible-character variants. So if `admin` has passkeys, signing in through LDAP or RADIUS as `Admin`, `admin@corp` or `CORP\admin` is stopped with a message to use the registered spelling, rather than skipping the passkey step. Such a spelling also cannot enrol a passkey of its own without a passkey-verified session. Through LDAP or RADIUS, passkeys cannot be registered under a name containing `\` or `/` (pfSense signs `x\carol` in as LDAP user `x`, so such a passkey would wrongly count for `carol`): those users sign in with their plain name to register. A passkey stands for every spelling a backend may take for its owner, never fewer: with `ldap_nostrip_at` and two distinct accounts `carol` and `carol@corp.com`, a passkey of `carol@corp.com` therefore also stops `carol` (an admin can remove it). No username with control or format characters can hold passkeys. **With LDAP or RADIUS, turn Enforce on.** Recognising other spellings is a best effort: a directory may accept names this package cannot foresee. Enforce refuses every account without a passkey, whatever the backend accepts as a name; the Settings tab warns while LDAP or RADIUS servers exist and Enforce is off. If PHP's intl or mbstring extension is missing, every passkey counts for every LDAP/RADIUS user (they then all need their own passkey). For local accounts the sign-in name is resolved through pfSense's user database; a name that resolves to no account is refused.
-
-Users with the `page-all` privilege (admins) manage everyone's passkeys and the settings. Other users can register and remove only their own passkeys, if they are granted access to `system_webauthn.php`.
-
-## Security notes and limits
-
-**What is covered:** every web GUI page. That includes the lightweight status endpoints such as `getstats.php`, which use `auth_check.inc`: a hook makes them ignore the session's cached page privileges unless the session has passed the gate (or is exempt for this request). XMLRPC is refused when it arrives through the tunnel and, while the second factor is enabled, from hosts that are not XMLRPC peers or on a trusted network. Passkey registrations and removals, settings changes, and 5 failed passkey attempts after a correct password each raise a GUI notice (failed attempts at most once per user every 15 minutes). The notice is also sent by e-mail or another notification channel, if you have one configured. Names in notices and config history are reduced to one line of plain text and quoted, so a crafted LDAP name cannot forge lines. Passkey names may contain letters, digits, spaces and `. _ ( ) -` only (up to 64 characters), because pfSense writes control characters into config.xml unchanged, which would make it unreadable.
-
-**What is not covered:**
-- `/xmlrpc.php` from a configured XMLRPC peer or a trusted network (password only). It is refused from everywhere else while the second factor is enabled.
-- SSH and the console.
-- Other services (VPN and similar).
-- Add-on packages with their own authentication, such as a REST API package.
-
-**When the second factor silently switches off (fail-open):**
-- **The hook is missing.** This happens during a pfSense upgrade until the next boot or cron run re-applies it (at most 5 minutes), if the boot command and cron job were removed (for example by restoring an old config backup), or if pfSense ever changes the code the hook is anchored to (a GUI notice is raised). Run `/usr/local/pkg/webauthn/hook.php status` after upgrades and restores.
-- **The settings are gone.** This happens when you restore a config backup taken before WebAuthn was enabled. The Passkeys tab then shows "disabled".
-
-Errors inside the gate fail closed: the page does not load.
-
-**Trusted networks** skip the passkey entirely. Trusted networks and XMLRPC peers must be at least `/8` (IPv4) or `/16` (IPv6). Saving an RP ID that none of your passkeys was registered for is refused unless you save from a trusted network. An admin session from a trusted network is effectively root: it can turn the second factor off, remove passkeys, or run shell commands under Diagnostics > Command Prompt. The rule that a second passkey needs a passkey-verified session only slows such an attacker down. Every one of those changes raises a notice, but the real protection is keeping trusted networks narrow. Keep the list as narrow as possible: a management VLAN, rather than a whole LAN with guests and IoT devices. A single address inside a shared LAN is weak: any host on that segment can take the address over while your PC is off.
-
-**User verification:** *Required* makes the authenticator ask for a PIN or biometric on every use. Choose it if your authenticators support it.
-
-**Updates run as root on your firewall.** Pin the download to a commit you have reviewed (`.../tar.gz/<commit-sha>`) instead of a branch. Protect the GitHub account that hosts the code with 2FA.
-
-## Tests
-
-```sh
-php tests/run.php                        # verifier, CBOR, policy, settings validation, authgui hook (79 checks)
-php tests/gate_test.php                  # end-to-end gate requests with a software authenticator (14 checks)
-php tests/audit_test.php                 # security audit regressions F1-F7, incl. the real patched auth_check.inc (53 checks)
-php tests/review3/review3_test.php       # third review: username spellings, revocation, XMLRPC peers, nonce list (44 checks)
-php tests/review3/gate_ldap_variant.php  # third review, end to end through the gate (5 checks)
-php tests/review3/fuzz_parsers.php       # mutation fuzz of the CBOR / authenticator data / COSE parsers
-php tests/review4/review4_test.php       # fourth review: counter, verification binding, lost updates, names, uid, hardening (113 checks)
-php tests/review4/gate_review4.php       # fourth review, end to end through the gate (14 checks)
-php tests/review4/reload_fallback.php    # fourth review: config reload on pfSense versions without config_read_file() (4 checks)
-php tests/review4/review4b_test.php      # independent review: parallel removal, LDAP/RADIUS names, challenge limits, outside changes (34 checks)
-sh tests/review3/hook_enospc.sh          # root on Linux: patching on a full disk leaves authgui.inc untouched
-```
-
-`tests/fixtures/` holds pfSense's upstream `authgui.inc`, `auth_check.inc` and `xmlrpc.php` (Apache-2.0). The tests use them to check that every hook anchor matches and that each patched file still parses.
+- **Not covered:** SSH and the console, other services (VPN etc.), packages with their own login. XMLRPC (`/xmlrpc.php`) uses a password only; while the second factor is on it is refused except from XMLRPC peers and trusted networks.
+- **Protection can switch off** if the hook is missing: during a pfSense upgrade until the next boot or cron run (at most 5 minutes), or if pfSense changes the code the hook is anchored to (a GUI notice is raised). Run `hook.php status` after every upgrade or config restore.
+- **A passkey belongs to the exact username.** Removing a passkey signs out the sessions it verified. A verification expires after 12 hours.
+- Passkeys and settings live in `config.xml` (included in backups). Counters and the list of removed passkeys are in `/conf`, not in backups.
+- If the package files are removed without the uninstaller, the GUI stops working (fail closed) instead of skipping the passkey step.
