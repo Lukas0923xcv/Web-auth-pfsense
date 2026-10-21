@@ -11,11 +11,13 @@ cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/we
 rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
 
-Then check that everything is in place (all five lines must say `present`):
+Then check that everything is in place. The first line shows the installed version, the other five must say `present`:
 
 ```sh
 /usr/local/pkg/webauthn/hook.php status
 ```
+
+The version is also shown at the bottom of **System > WebAuthn Passkeys**. The newest version is in the file `src/usr/local/pkg/webauthn/VERSION` in this repository.
 
 The second factor stays **off** until you enable it in **System > WebAuthn Passkeys > Settings**. After an update every session has to confirm with its passkey once.
 

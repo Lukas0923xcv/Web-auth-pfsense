@@ -317,5 +317,7 @@ else:
 </div>
 <?php
 endif;
-
+?>
+<p class="text-muted"><?=sprintf(gettext('pfSense WebAuthn Passkeys, version %s'), htmlspecialchars(webauthn_version()))?></p>
+<?php
 include("foot.inc");

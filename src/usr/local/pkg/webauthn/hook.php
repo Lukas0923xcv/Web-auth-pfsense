@@ -231,6 +231,8 @@ case 'ensure':
 	exit(patch_all() ? 0 : 1);
 case 'status':
 	$ok = true;
+	$version = trim((string)@file_get_contents(__DIR__ . '/VERSION'));
+	echo 'version: ' . ($version !== '' ? $version : 'unknown') . "\n";
 	foreach (webauthn_hook_targets() as $target => $t) {
 		$src = (string)@file_get_contents($t['file']);
 		$state = webauthn_hook_current($src, $target) ? 'present' : (webauthn_hook_present($src) ? 'OUTDATED' : 'MISSING');

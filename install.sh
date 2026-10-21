@@ -12,6 +12,7 @@ for f in \
 	usr/local/pkg/webauthn/hook.inc \
 	usr/local/pkg/webauthn/xmlrpc_guard.inc \
 	usr/local/pkg/webauthn/hook.php \
+	usr/local/pkg/webauthn/VERSION \
 	usr/local/www/system_webauthn.php \
 	usr/local/www/webauthn/webauthn.js \
 	usr/local/etc/rc.d/webauthn_hook.sh

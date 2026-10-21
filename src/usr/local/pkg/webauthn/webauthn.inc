@@ -80,6 +80,12 @@ function webauthn_default_settings(): array {
 	];
 }
 
+/* The installed version of this package (the VERSION file next to this one). */
+function webauthn_version(): string {
+	$v = trim((string)@file_get_contents(__DIR__ . '/VERSION'));
+	return preg_match('/^[0-9A-Za-z.\-]{1,32}$/', $v) ? $v : 'unknown';
+}
+
 function webauthn_settings(): array {
 	$s = config_get_path(WEBAUTHN_CONFIG_PATH, []);
 	return array_merge(webauthn_default_settings(), is_array($s) ? $s : []);
