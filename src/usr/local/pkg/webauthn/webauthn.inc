@@ -40,12 +40,19 @@ if (!defined('WEBAUTHN_CONFIG_LOCK')) {
 if (!defined('WEBAUTHN_NOTICE_FILE')) {
 	define('WEBAUTHN_NOTICE_FILE', '/conf/webauthn_notices.json');
 }
+if (!defined('WEBAUTHN_STATE_FILE')) {
+	/* Hash of installedpackages/webauthn as last saved by this package. */
+	define('WEBAUTHN_STATE_FILE', '/conf/webauthn_state.json');
+}
 define('WEBAUTHN_MAX_FAILURES', 5);
 define('WEBAUTHN_CHALLENGE_TTL', 300);
 /* A passkey verification is good for this long at most (seconds). */
 define('WEBAUTHN_VERIFIED_MAX_AGE', 12 * 3600);
-/* Upper bound for unexpired entries in the used-challenge list. */
+/* Upper bound for unexpired entries in the used-challenge list, in all and per user. */
 define('WEBAUTHN_MAX_LIVE_NONCES', 10000);
+define('WEBAUTHN_MAX_LIVE_NONCES_PER_USER', 50);
+/* Passkeys per account. */
+define('WEBAUTHN_MAX_CREDENTIALS_PER_USER', 20);
 /* At most one failed-attempt notice per user in this many seconds. */
 define('WEBAUTHN_NOTICE_INTERVAL', 900);
 
@@ -205,6 +212,53 @@ function webauthn_session_sid(): string {
 /* Is this request a password sign-in (pfSense's login form)? */
 function webauthn_is_login_post(): bool {
 	return isset($_POST['login']) && isset($_POST['usernamefld']);
+}
+
+/*
+ * For a session signed in through an LDAP server, the account name
+ * pfSense's ldap_backed() actually authenticated: the part before "@"
+ * (unless the server has ldap_nostrip_at) and then before "". Null for
+ * other sessions.
+ */
+function webauthn_ldap_account(array $session): ?string {
+	$source = (string)($session['authsource'] ?? '');
+	if (!str_starts_with($source, 'LDAP/')) {
+		return null;
+	}
+	$nostrip = false;
+	foreach ((array)config_get_path('system/authserver', []) as $a) {
+		if (is_array($a) && ($a['type'] ?? '') === 'ldap' && 'LDAP/' . ($a['name'] ?? '') === $source) {
+			$nostrip = isset($a['ldap_nostrip_at']);
+		}
+	}
+	$u = webauthn_normalize_username($session['Username'] ?? '');
+	if (!$nostrip && str_contains($u, '@')) {
+		$u = explode('@', $u, 2)[0];
+	}
+	if (str_contains($u, '\\')) {
+		$u = explode('\\', $u, 2)[0];
+	}
+	return $u;
+}
+
+/*
+ * May passkeys be stored under this session's name? Not if it holds
+ * control or format characters (they would end up in config.xml). For
+ * LDAP, not if another spelling of the name would make the passkey seem
+ * to belong to a different account: pfSense authenticates "x\carol" as
+ * LDAP user x, so a passkey stored under it must not count for carol.
+ */
+function webauthn_registrable_name(array $session): bool {
+	$u = webauthn_session_identity($session);
+	if ($u === '' || preg_match('//u', $u) !== 1 || preg_match('/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u', $u)) {
+		return false;
+	}
+	$account = webauthn_ldap_account($session);
+	if ($account === null) {
+		return true;
+	}
+	$allowed = [webauthn_username_fold($u), webauthn_username_fold($account)];
+	return empty(array_diff(webauthn_username_keys($u, false), $allowed));
 }
 
 /* Passkeys registered under another spelling of the sign-in name $username (see webauthn_username_keys()). */
@@ -463,15 +517,18 @@ function webauthn_may_register(array $settings, array $session, array $source, b
 /*
  * May this session remove passkey $id? Admins may always (the recovery
  * path from a trusted network). Other users may not remove their last
- * passkey without a session verified with a passkey: a password alone
- * would otherwise switch the passkey step off for the account.
+ * usable passkey without a session verified with a passkey: a password
+ * alone would otherwise switch the passkey step off for the account.
+ * For the page only; webauthn_delete_credential() decides again under
+ * the config lock.
  */
 function webauthn_may_delete(array $settings, array $session, array $source, string $id, bool $is_admin): bool {
 	if ($is_admin) {
 		return true;
 	}
-	$left = array_filter(webauthn_get_credentials(webauthn_session_identity($session)), function ($c) use ($id) {
-		return ($c['id'] ?? null) !== $id;
+	$rp = webauthn_rp_id($settings);
+	$left = array_filter(webauthn_get_credentials(webauthn_session_identity($session)), function ($c) use ($id, $rp) {
+		return ($c['id'] ?? null) !== $id && ($c['rp_id'] ?? null) === $rp;
 	});
 	return !empty($left) || webauthn_session_status($settings, $session, $source) === 'verified';
 }
@@ -707,13 +764,60 @@ function webauthn_orphaned(array $c): bool {
  * returns false to abort. pfSense's own config lock (/tmp/config.lock) is
  * a different file, taken inside write_config(): no deadlock.
  */
-function webauthn_config_update(callable $change, string $desc): bool {
-	return webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () use ($change, $desc) {
+function webauthn_config_update(callable $change, string $desc, ?callable $after = null): bool {
+	return webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () use ($change, $desc, $after) {
 		if (!webauthn_config_reload() || $change() === false) {
 			return false;
 		}
-		return is_array(write_config(webauthn_plain($desc, 200)));
+		if (!is_array(write_config(webauthn_plain($desc, 200)))) {
+			return false;
+		}
+		webauthn_record_config_state();
+		/* Still under the lock, so it cannot interleave with another change. */
+		return $after === null || $after() !== false;
 	}, false);
+}
+
+/* Hash of the package's part of the in-memory config. */
+function webauthn_config_hash(): string {
+	return hash('sha256', serialize(config_get_path('installedpackages/webauthn', [])));
+}
+
+/* Remember the package's config as saved now. */
+function webauthn_record_config_state(): bool {
+	return webauthn_write_json(WEBAUTHN_STATE_FILE, ['hash' => webauthn_config_hash(), 'time' => time()]);
+}
+
+/*
+ * Did installedpackages/webauthn change since this package last saved it?
+ * Other pages save the whole config as it was when their request began,
+ * so a save overlapping a passkey or settings change can undo it (removed
+ * passkeys stay revoked regardless); a config restore changes it too.
+ * Neither can be prevented from here, but neither stays silent: the first
+ * request that sees the difference raises a notice and records the new
+ * state. Returns true if a difference was found.
+ */
+function webauthn_check_config_state(): bool {
+	$now = webauthn_config_hash();
+	$data = json_decode((string)@file_get_contents(WEBAUTHN_STATE_FILE), true);
+	if (is_array($data) && ($data['hash'] ?? null) === $now) {
+		return false;
+	}
+	$changed = webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () use ($now) {
+		$data = json_decode((string)@file_get_contents(WEBAUTHN_STATE_FILE), true);
+		$known = is_array($data) && isset($data['hash']);
+		if ($known && $data['hash'] === $now) {
+			return false;
+		}
+		webauthn_record_config_state();
+		return $known;
+	}, false);
+	if ($changed) {
+		webauthn_log(LOG_WARNING, 'passkeys or settings changed outside the WebAuthn page (config restore, or another page saving an older copy)');
+		webauthn_notice('The WebAuthn passkeys or settings changed outside System > WebAuthn Passkeys: a config restore, ' .
+		    'or another page saving an older copy of the configuration at the same time. Check that the settings and passkeys are as intended.');
+	}
+	return $changed;
 }
 
 /*
@@ -752,6 +856,7 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 			$error = gettext('The list of removed passkeys is damaged; see the system log.');
 			return false;
 		}
+		$own = 0;
 		foreach ($all as $i => $c) {
 			if (($c['id'] ?? null) === $id) {
 				if (!isset($revoked[$id])) {
@@ -760,7 +865,14 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 				}
 				/* A revoked record brought back (e.g. by a restore) is replaced. */
 				unset($all[$i]);
+			} elseif (!isset($revoked[(string)($c['id'] ?? '')]) &&
+			    webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username)) {
+				$own++;
 			}
+		}
+		if ($own >= WEBAUTHN_MAX_CREDENTIALS_PER_USER) {
+			$error = sprintf(gettext('An account can have at most %d passkeys.'), WEBAUTHN_MAX_CREDENTIALS_PER_USER);
+			return false;
 		}
 		$all = array_values($all);
 		/* Stored before the passkey becomes usable: a counter that cannot
@@ -783,14 +895,18 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 		}
 		$all[] = $rec;
 		config_set_path(WEBAUTHN_CRED_PATH, $all);
-	}, sprintf('WebAuthn: registered passkey "%s" for user "%s"', webauthn_plain($name), webauthn_plain($username)));
+	}, sprintf('WebAuthn: registered passkey "%s" for user "%s"', webauthn_plain($name), webauthn_plain($username)),
+	    function () use ($id, &$error) {
+		/* Only now, with the record that replaces any revoked one saved (and
+		 * still under the lock): lifting the revocation earlier would revive
+		 * that old record if the save failed. */
+		if (!webauthn_unrevoke($id)) {
+			$error = gettext('The passkey was saved but cannot be used yet: the list of removed passkeys could not be updated.');
+			return false;
+		}
+	});
 	if (!$ok) {
 		return $error ?? gettext('The configuration could not be saved.');
-	}
-	/* Only now, with the record that replaces any revoked one saved: lifting
-	 * the revocation earlier would revive that old record if the save failed. */
-	if (!webauthn_unrevoke($id)) {
-		return gettext('The passkey was saved but cannot be used yet: the list of removed passkeys could not be updated.');
 	}
 	return null;
 }
@@ -799,20 +915,37 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
  * Delete a credential; restrict to $username unless null (admin). Every
  * record with that ID goes, and the ID is revoked first, so it is never
  * accepted again even if the change cannot be saved or a config restore
- * brings it back. True only if the change was saved and the ID is gone.
+ * brings it back. Unless $may_remove_last, the account must keep another
+ * usable passkey (for the current RP ID). All of it is decided under the
+ * config lock on the reloaded config, so parallel removals cannot each
+ * leave the other passkey as "the one left". True only if the change was
+ * saved and the ID is gone; $error says why not.
  */
-function webauthn_delete_credential(string $id, ?string $username = null): bool {
+function webauthn_delete_credential(string $id, ?string $username = null, bool $may_remove_last = true, ?string &$error = null): bool {
+	$error = null;
 	$match = function ($c) use ($id, $username) {
 		return is_array($c) && ($c['id'] ?? null) === $id && ($username === null ||
 		    webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username));
 	};
-	if (empty(array_filter(webauthn_all_credentials(), $match))) {
-		return false;
-	}
-	if (!webauthn_revoke($id)) {
-		return false;
-	}
-	$ok = webauthn_config_update(function () use ($match) {
+	$ok = webauthn_config_update(function () use ($id, $username, $may_remove_last, $match, &$error) {
+		if (empty(array_filter(webauthn_all_credentials(), $match))) {
+			$error = gettext('Passkey not found.');
+			return false;
+		}
+		if (!$may_remove_last && $username !== null) {
+			$rp = webauthn_rp_id(webauthn_settings());
+			$left = array_filter(webauthn_get_credentials($username), function ($c) use ($id, $rp) {
+				return ($c['id'] ?? null) !== $id && ($c['rp_id'] ?? null) === $rp;
+			});
+			if (empty($left)) {
+				$error = gettext('This is your last usable passkey: sign in with it (through a non-trusted path) before removing it, or ask an administrator.');
+				return false;
+			}
+		}
+		if (!webauthn_revoke($id)) {
+			$error = gettext('The passkey could not be revoked. Check the system log.');
+			return false;
+		}
 		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
 		$all = is_array($all) ? (isset($all['id']) && !is_array($all['id']) ? [$all] : $all) : [];
 		$keep = [];
@@ -822,14 +955,19 @@ function webauthn_delete_credential(string $id, ?string $username = null): bool 
 			}
 		}
 		config_set_path(WEBAUTHN_CRED_PATH, $keep);
-	}, 'WebAuthn: removed passkey ' . substr($id, 0, 16));
-	if (!$ok || !webauthn_config_reload()) {
-		return false;
-	}
-	foreach ((array)config_get_path(WEBAUTHN_CRED_PATH, []) as $c) {
-		if (is_array($c) && ($c['id'] ?? null) === $id) {
+	}, 'WebAuthn: removed passkey ' . substr($id, 0, 16), function () use ($id) {
+		if (!webauthn_config_reload()) {
 			return false;
 		}
+		foreach ((array)config_get_path(WEBAUTHN_CRED_PATH, []) as $c) {
+			if (is_array($c) && ($c['id'] ?? null) === $id) {
+				return false;
+			}
+		}
+	});
+	if (!$ok) {
+		$error = $error ?? gettext('The passkey could not be removed. Check the system log.');
+		return false;
 	}
 	webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id) {
 		$data = webauthn_read_counters();
@@ -1100,13 +1238,22 @@ function webauthn_use_challenge(string $purpose, string $username, string $clien
 		return null;
 	}
 	[$challenge, $nonce, $expires] = $parsed;
-	return webauthn_with_lock(WEBAUTHN_USED_FILE, function () use ($challenge, $nonce, $expires, $now, $verify) {
+	$who = substr(hash('sha256', webauthn_normalize_username($username)), 0, 16);
+	return webauthn_with_lock(WEBAUTHN_USED_FILE, function () use ($challenge, $nonce, $expires, $now, $verify, $who) {
 		$used = webauthn_used_nonces($now);
 		if ($used === null || isset($used[$nonce]) || count($used) >= WEBAUTHN_MAX_LIVE_NONCES) {
 			return null;
 		}
+		/* Per user too: one account completing ceremonies over and over
+		 * only blocks itself, never everyone else's sign-ins. */
+		$mine = count(array_filter($used, function ($v) use ($who) {
+			return is_array($v) && ($v['u'] ?? null) === $who;
+		}));
+		if ($mine >= WEBAUTHN_MAX_LIVE_NONCES_PER_USER) {
+			return null;
+		}
 		$result = $verify($challenge);
-		$used[$nonce] = $expires;
+		$used[$nonce] = ['e' => $expires, 'u' => $who];
 		if (!webauthn_write_json(WEBAUTHN_USED_FILE, $used)) {
 			throw new WebAuthnException('The used-challenge list could not be written');
 		}
@@ -1141,8 +1288,10 @@ function webauthn_used_nonces(int $now): ?array {
 		}
 		$used = [];
 	}
-	return array_filter($used, function ($exp) use ($now) {
-		return is_int($exp) && $exp >= $now;
+	/* Entries are ['e' => expiry, 'u' => user hash]; older ones a bare expiry. */
+	return array_filter($used, function ($v) use ($now) {
+		$exp = is_int($v) ? $v : (is_array($v) && is_int($v['e'] ?? null) ? $v['e'] : 0);
+		return $exp >= $now;
 	});
 }
 

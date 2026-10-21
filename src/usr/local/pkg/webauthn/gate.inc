@@ -12,6 +12,8 @@
 require_once(__DIR__ . '/webauthn.inc');
 
 function webauthn_gate(): void {
+	/* Before the enable check: a stale save switching the second factor off must not go unnoticed. */
+	webauthn_check_config_state();
 	$settings = webauthn_settings();
 	if (empty($settings['enable'])) {
 		return;
