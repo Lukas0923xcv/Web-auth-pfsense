@@ -58,16 +58,29 @@ Tests: `tests/review4/review4_test.php` (113 checks), `tests/review4/gate_review
 
 ## Independent review of the state at ca954e9
 
-A separate reviewer, without the author's reasoning, audited all files again against threat models a–d. Its reproductions were re-run here before fixing. Tests: `tests/review4/review4b_test.php` (21 checks, including two processes racing).
+A separate reviewer, without the author's reasoning, audited all files again against threat models a–d. Its reproductions were re-run here before fixing. Tests: `tests/review4/review4b_test.php` (32 checks, including two processes racing).
 
 | Finding | Fix | Test |
 |---|---|---|
 | R4-I (confirmed, medium) Two parallel removals by a non-admin with a password-only session each saw the other passkey as "the one left" and removed both; the account then counted as passkey-free, so the password alone could enrol a new passkey. Reproduced 20/20. | `webauthn_delete_credential()` decides "another usable passkey is left" under the config lock on the reloaded config, together with revoking and removing. Only passkeys for the current RP ID count as usable. | review4b R4-I (fails without the locked check) |
-| R4-J (confirmed, low) LDAP user x could sign in as `x\carol` (pfSense authenticates the part before `\`), register a "first" passkey under that name, and thereby make carol's account look as if it had a passkey: carol was refused through the tunnel and could not enrol. | `webauthn_registrable_name()`: through LDAP, passkeys can only be stored under names pfSense authenticates as that same account (honouring `ldap_nostrip_at`); names with control or format characters are refused for every backend. | review4b R4-J |
-| R4-K (confirmed, low) The global cap of the used-challenge list could be filled by anyone holding one passkey (repeated registrations, also of an existing ID, which saved nothing but used a challenge), blocking every passkey sign-in. | Per-account limit of 50 live challenges (the global cap stays); registration verifies and saves inside the challenge check, so a ceremony that saves nothing uses nothing; at most 20 passkeys per account. | review4b R4-K |
+| R4-J (confirmed, low) LDAP user x could sign in as `x\carol` (pfSense authenticates the part before `\`), register a "first" passkey under that name, and thereby make carol's account look as if it had a passkey: carol was refused through the tunnel and could not enrol. | `webauthn_registrable_name()`: remote names with `\` or `/` cannot hold passkeys (see N2/R4-J below for the final form); names with control or format characters are refused for every backend. | review4b R4-J |
+| R4-K (confirmed, low) The global cap of the used-challenge list could be filled by anyone holding one passkey (repeated registrations, also of an existing ID, which saved nothing but used a challenge), blocking every passkey sign-in. | Per-account limit of 50 live challenges (the global cap stays), at most 20 passkeys per account (see N1 for where the save happens). | review4b R4-K |
 | R4-L (theoretical) Re-registering a revoked ID while an admin removed it again could end with the record gone and the ID unrevoked. | Lifting a revocation runs in the after-save step inside the config lock; removal revokes inside the same lock. | review4b R4-L |
 | R4-M (theoretical) Another pfSense page saving an older copy of the whole config at the same moment can undo a passkey registration or settings change, for example switch the second factor off, silently. | Cannot be prevented from the add-on (pfSense pages do not take its lock). Made visible: the package records a hash of its config section after each own save; the first GUI request that sees a different section raises a notice. The check runs before the enable check, so a switch-off is reported too. | review4b R4-M |
 | R4-N (theoretical) Control characters in remote login names reach config.xml through passkey records. | Covered by R4-J (refused). pfSense itself writes the same name into revision entries on any save by that session; outside the add-on. | review4b R4-J |
+
+### Second independent pass (state 2e02b0f)
+
+R4-I, R4-J (LDAP) and R4-K were confirmed fixed by re-running the reproductions. New findings, all low, none a way past the passkey step:
+
+| Finding | Fix | Test |
+|---|---|---|
+| N1 Registration saved the config while holding the used-challenge lock that every passkey sign-in needs; a failing registration (duplicate ID, passkey cap) could be resent for 300 s and stall everyone's sign-in for the length of each config save. | The challenge is checked and recorded under the lock (counted per account), the passkey is saved after the lock is released. Challenges wasted that way count only against the attacker's own account limit. | review4b N1 |
+| N2 With `ldap_nostrip_at`, users whose name contains "@" could not register at all. | They can; their passkeys are marked `exact` and stand only for that name (and its case/width variants), so `carol@corp.com` never shadows a different account `carol`. Same for "%" in LDAP names. | review4b N2 |
+| N3 If the state file could not be written, every GUI request raised a notice and an e-mail. | The outside-change notice is rate limited (15 minutes). | review4b N3 |
+| N4 False "changed outside" alarms: a request that had loaded the config just before this package saved; and the hash differed after config.xml dropped an empty list. | On a difference, the section on disk is compared (pfSense's `parse_xml_config()`), and the hash ignores empty lists and value types. | review4b N4 |
+| R4-J for RADIUS: a server that authenticates the part before "\" or "/" would let `x\carol` shadow carol. | Remote names with "\" or "/" cannot hold passkeys (sign in with the plain name to register). | review4b R4-J |
+| Passkeys of a deleted account counted towards the 20-passkey limit of a new account with that name. | Orphaned records are not counted. | review4b R4-K |
 
 Kept as documented limits (README): unprotected windows while a pfSense upgrade or a removed boot command and cron job leave a hook missing (the hook cannot run when it is not there; a notice is raised when patching fails); name equivalences of LDAP/RADIUS servers beyond the folding rules, for which Enforce is the answer.
 

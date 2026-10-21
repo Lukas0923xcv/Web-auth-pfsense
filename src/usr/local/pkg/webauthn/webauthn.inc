@@ -221,15 +221,9 @@ function webauthn_is_login_post(): bool {
  * other sessions.
  */
 function webauthn_ldap_account(array $session): ?string {
-	$source = (string)($session['authsource'] ?? '');
-	if (!str_starts_with($source, 'LDAP/')) {
+	$nostrip = webauthn_ldap_nostrip($session);
+	if ($nostrip === null) {
 		return null;
-	}
-	$nostrip = false;
-	foreach ((array)config_get_path('system/authserver', []) as $a) {
-		if (is_array($a) && ($a['type'] ?? '') === 'ldap' && 'LDAP/' . ($a['name'] ?? '') === $source) {
-			$nostrip = isset($a['ldap_nostrip_at']);
-		}
 	}
 	$u = webauthn_normalize_username($session['Username'] ?? '');
 	if (!$nostrip && str_contains($u, '@')) {
@@ -241,24 +235,46 @@ function webauthn_ldap_account(array $session): ?string {
 	return $u;
 }
 
+/* For an LDAP session: does its server keep "@domain" (ldap_nostrip_at)? Null for other sessions. */
+function webauthn_ldap_nostrip(array $session): ?bool {
+	$source = (string)($session['authsource'] ?? '');
+	if (!str_starts_with($source, 'LDAP/')) {
+		return null;
+	}
+	$nostrip = false;
+	foreach ((array)config_get_path('system/authserver', []) as $a) {
+		if (is_array($a) && ($a['type'] ?? '') === 'ldap' && 'LDAP/' . ($a['name'] ?? '') === $source) {
+			$nostrip = isset($a['ldap_nostrip_at']);
+		}
+	}
+	return $nostrip;
+}
+
 /*
  * May passkeys be stored under this session's name? Not if it holds
  * control or format characters (they would end up in config.xml). For
- * LDAP, not if another spelling of the name would make the passkey seem
- * to belong to a different account: pfSense authenticates "x\carol" as
- * LDAP user x, so a passkey stored under it must not count for carol.
+ * LDAP and RADIUS, not if it contains "\" or "/": the part after them
+ * would make the passkey count for another account, although the backend
+ * may have authenticated the part before (pfSense signs "x\carol" in as
+ * LDAP user x). Such users register under their plain name.
  */
 function webauthn_registrable_name(array $session): bool {
 	$u = webauthn_session_identity($session);
 	if ($u === '' || preg_match('//u', $u) !== 1 || preg_match('/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u', $u)) {
 		return false;
 	}
-	$account = webauthn_ldap_account($session);
-	if ($account === null) {
-		return true;
-	}
-	$allowed = [webauthn_username_fold($u), webauthn_username_fold($account)];
-	return empty(array_diff(webauthn_username_keys($u, false), $allowed));
+	return webauthn_session_is_local($session) || (!str_contains($u, '\\') && !str_contains($u, '/'));
+}
+
+/*
+ * Must a passkey registered by this session stand for its exact name
+ * only (see webauthn_credential_keys())? For LDAP names the server does
+ * not shorten: with ldap_nostrip_at an "@", and "%" in any case.
+ */
+function webauthn_registration_exact(array $session): bool {
+	$nostrip = webauthn_ldap_nostrip($session);
+	$u = webauthn_session_identity($session);
+	return $nostrip !== null && (($nostrip && str_contains($u, '@')) || str_contains($u, '%'));
 }
 
 /* Passkeys registered under another spelling of the sign-in name $username (see webauthn_username_keys()). */
@@ -268,11 +284,27 @@ function webauthn_case_variant_credentials(string $username): array {
 	foreach (webauthn_all_credentials() as $c) {
 		$name = webauthn_normalize_username($c['username'] ?? '');
 		if ($name !== webauthn_normalize_username($username) &&
-		    !empty(array_intersect(webauthn_username_keys($name, false), $mine))) {
+		    !empty(array_intersect(webauthn_credential_keys($c), $mine))) {
 			$out[] = $c;
 		}
 	}
 	return $out;
+}
+
+/*
+ * The names a stored passkey stands for. A passkey marked 'exact' was
+ * registered under a name its backend does not shorten (LDAP with
+ * ldap_nostrip_at, or a "%" in an LDAP name): only that name and its
+ * case/width variants count, so "carol@corp.com" does not stand for a
+ * different account "carol".
+ */
+function webauthn_credential_keys(array $c): array {
+	$name = webauthn_normalize_username($c['username'] ?? '');
+	if (!empty($c['exact'])) {
+		$k = webauthn_username_fold($name);
+		return $k === '' ? [] : [$k];
+	}
+	return webauthn_username_keys($name, false);
 }
 
 /* Split a whitespace/comma separated list, dropping empties. */
@@ -778,9 +810,40 @@ function webauthn_config_update(callable $change, string $desc, ?callable $after
 	}, false);
 }
 
-/* Hash of the package's part of the in-memory config. */
-function webauthn_config_hash(): string {
-	return hash('sha256', serialize(config_get_path('installedpackages/webauthn', [])));
+/*
+ * Hash of the package's part of a config ($section, default: in memory).
+ * Normalised as config.xml stores it: empty lists dropped, values as
+ * strings, so a save and its re-read hash alike.
+ */
+function webauthn_config_hash($section = null): string {
+	$norm = function ($v) use (&$norm) {
+		if (!is_array($v)) {
+			return (string)$v;
+		}
+		$out = [];
+		foreach ($v as $k => $x) {
+			$x = $norm($x);
+			if ($x !== []) {
+				$out[(string)$k] = $x;
+			}
+		}
+		return $out;
+	};
+	$section = func_num_args() ? $section : config_get_path('installedpackages/webauthn', []);
+	return hash('sha256', serialize($norm(is_array($section) ? $section : [])));
+}
+
+/* The package's part of config.xml as it is on disk now; null if it cannot be read. */
+function webauthn_disk_section(): ?array {
+	if (!function_exists('parse_xml_config') || !function_exists('g_get')) {
+		return null;
+	}
+	$parsed = parse_xml_config(g_get('conf_path') . '/config.xml', [g_get('xml_rootobj')]);
+	if (!is_array($parsed)) {
+		return null;
+	}
+	$section = $parsed['installedpackages']['webauthn'] ?? [];
+	return is_array($section) ? $section : [];
 }
 
 /* Remember the package's config as saved now. */
@@ -798,24 +861,28 @@ function webauthn_record_config_state(): bool {
  * state. Returns true if a difference was found.
  */
 function webauthn_check_config_state(): bool {
-	$now = webauthn_config_hash();
 	$data = json_decode((string)@file_get_contents(WEBAUTHN_STATE_FILE), true);
-	if (is_array($data) && ($data['hash'] ?? null) === $now) {
+	if (is_array($data) && ($data['hash'] ?? null) === webauthn_config_hash()) {
 		return false;
 	}
-	$changed = webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () use ($now) {
+	$changed = webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () {
 		$data = json_decode((string)@file_get_contents(WEBAUTHN_STATE_FILE), true);
 		$known = is_array($data) && isset($data['hash']);
+		/* This request may simply have loaded the config before the last
+		 * save by this package: compare what is on disk now. */
+		$disk = webauthn_disk_section();
+		$now = $disk === null ? webauthn_config_hash() : webauthn_config_hash($disk);
 		if ($known && $data['hash'] === $now) {
 			return false;
 		}
-		webauthn_record_config_state();
+		webauthn_write_json(WEBAUTHN_STATE_FILE, ['hash' => $now, 'time' => time()]);
 		return $known;
 	}, false);
 	if ($changed) {
 		webauthn_log(LOG_WARNING, 'passkeys or settings changed outside the WebAuthn page (config restore, or another page saving an older copy)');
 		webauthn_notice('The WebAuthn passkeys or settings changed outside System > WebAuthn Passkeys: a config restore, ' .
-		    'or another page saving an older copy of the configuration at the same time. Check that the settings and passkeys are as intended.');
+		    'or another page saving an older copy of the configuration at the same time. Check that the settings and passkeys are as intended.',
+		    'config-state');
 	}
 	return $changed;
 }
@@ -845,10 +912,10 @@ function webauthn_config_reload(): bool {
  * Store a new passkey. Returns null on success, or an error message.
  * $uid: the pfSense uid of a local account, '' for remote accounts.
  */
-function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id, string $uid = ''): ?string {
+function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id, string $uid = '', bool $exact = false): ?string {
 	$id = webauthn_b64url_encode($reg['credential_id']);
 	$error = null;
-	$ok = webauthn_config_update(function () use ($username, $name, $reg, $rp_id, $uid, $id, &$error) {
+	$ok = webauthn_config_update(function () use ($username, $name, $reg, $rp_id, $uid, $exact, $id, &$error) {
 		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
 		$all = is_array($all) ? array_values(array_filter(isset($all['id']) && !is_array($all['id']) ? [$all] : $all, 'is_array')) : [];
 		$revoked = webauthn_revoked_ids();
@@ -865,7 +932,7 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 				}
 				/* A revoked record brought back (e.g. by a restore) is replaced. */
 				unset($all[$i]);
-			} elseif (!isset($revoked[(string)($c['id'] ?? '')]) &&
+			} elseif (!isset($revoked[(string)($c['id'] ?? '')]) && !webauthn_orphaned($c) &&
 			    webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username)) {
 				$own++;
 			}
@@ -892,6 +959,9 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 		];
 		if ($uid !== '') {
 			$rec['uid'] = $uid;
+		}
+		if ($exact) {
+			$rec['exact'] = 'yes';
 		}
 		$all[] = $rec;
 		config_set_path(WEBAUTHN_CRED_PATH, $all);

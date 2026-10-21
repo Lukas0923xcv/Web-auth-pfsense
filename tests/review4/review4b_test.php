@@ -82,9 +82,20 @@ check(webauthn_registrable_name(['Username' => 'carol'] + $ldap) && webauthn_reg
     'R4-J plain and @domain names can');
 check(!webauthn_registrable_name(['Username' => "eve\x01"] + $ldap) && !webauthn_registrable_name(['Username' => "eve\u{202E}x"] + $ldap),
     'R4-J names with control or format characters cannot');
+check(!webauthn_registrable_name(['Username' => 'x/carol'] + $ldap) && !webauthn_registrable_name(['Username' => 'x\\carol', 'authsource' => 'RADIUS/r']) &&
+    !webauthn_registrable_name(['Username' => 'x/carol', 'authsource' => 'RADIUS/r']), 'R4-J ...nor "\\" or "/" names through LDAP or RADIUS');
+check(webauthn_registrable_name(['Username' => 'carol@realm', 'authsource' => 'RADIUS/r']), 'R4-J RADIUS user@realm names can');
+check(!webauthn_registration_exact(['Username' => 'alice@corp'] + $ldap), 'R4-J stripped "@": passkey also stands for "alice"');
 setup_disk($settings, [], ['system' => ['authserver' => [['name' => 'corp', 'type' => 'ldap', 'ldap_nostrip_at' => '']]]]);
 check(webauthn_ldap_account(['Username' => 'alice@corp'] + $ldap) === 'alice@corp', 'R4-J ldap_nostrip_at respected');
-check(webauthn_registrable_name(['Username' => 'CORP\\carol', 'authsource' => 'RADIUS/r']), 'R4-J RADIUS realm names unaffected');
+/* N2: with ldap_nostrip_at, "@" names can register, and stand for themselves only. */
+check(webauthn_registrable_name(['Username' => 'carol@corp.com'] + $ldap) && webauthn_registration_exact(['Username' => 'carol@corp.com'] + $ldap),
+    'N2 nostrip: "carol@corp.com" can register, as an exact name');
+check(webauthn_add_credential('carol@corp.com', 'k', make_reg($rp), $rp, '', true) === null, 'N2 setup: registered');
+check(webauthn_session_status($settings, ['Username' => 'carol'] + $ldap, $tunnel) === 'deny',
+    'N2 the different account "carol" is not taken for its owner (no passkey: Enforce refuses as usual)');
+check(webauthn_session_status($settings, ['Username' => 'CAROL@corp.com'] + $ldap, $tunnel) === 'require',
+    'N2 a case variant of the exact name still needs its passkey');
 
 /* ---- R4-K: the used-challenge list cannot be filled by one account ---- */
 reset_dir($dir);
@@ -122,7 +133,13 @@ try {
 } catch (WebAuthnException $e) {
 }
 check(webauthn_use_challenge('register', 'bob', $cdj, function ($ch) { return 'fresh'; }) === 'fresh',
-    'R4-K a registration that saved nothing (duplicate ID) does not use up its challenge');
+    'R4-K a ceremony that fails inside the check does not use up its challenge');
+/* N1: the page saves the passkey after the challenge check, not while holding the lock every sign-in needs. */
+$page = file_get_contents(dirname(__DIR__, 2) . '/src/usr/local/www/system_webauthn.php');
+$use = strpos($page, "webauthn_use_challenge('register'");
+$end = strpos($page, '});', $use);
+$add = strpos($page, 'webauthn_add_credential(', $use);
+check($use !== false && $add > $end, 'N1 registration saves outside the used-challenge lock');
 reset_dir($dir);
 setup_disk($settings, []);
 for ($i = 0; $i < WEBAUTHN_MAX_CREDENTIALS_PER_USER; $i++) {
@@ -130,6 +147,13 @@ for ($i = 0; $i < WEBAUTHN_MAX_CREDENTIALS_PER_USER; $i++) {
 }
 check(count(webauthn_get_credentials('bob')) === WEBAUTHN_MAX_CREDENTIALS_PER_USER && webauthn_add_credential('bob', 'one more', make_reg($rp), $rp) !== null,
     'R4-K at most ' . WEBAUTHN_MAX_CREDENTIALS_PER_USER . ' passkeys per account');
+reset_dir($dir);
+$orphans = [];
+for ($i = 0; $i < WEBAUTHN_MAX_CREDENTIALS_PER_USER; $i++) {
+	$orphans[] = rec('bob', "O$i", $rp, ['uid' => '1999']);   /* of a deleted account "bob" */
+}
+setup_disk($settings, $orphans);
+check(webauthn_add_credential('bob', 'new', make_reg($rp), $rp, '2000') === null, 'R4-K passkeys of a deleted account do not count towards the limit');
 
 /* ---- R4-L: revocation lifted and set under the same lock ---- */
 $src = file_get_contents(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/webauthn.inc');
@@ -150,6 +174,32 @@ write_config('other page');
 check(webauthn_check_config_state() && str_contains((string)@file_get_contents("$dir/notices.log"), 'changed outside'),
     'R4-M a stale save switching the second factor off raises a notice');
 check(!webauthn_check_config_state(), 'R4-M ...once');
+/* N4: a request that loaded the config before this package's last save is not an outside change. */
+reset_dir($dir);
+setup_disk($settings, []);
+webauthn_check_config_state();
+$stale = $GLOBALS['test_config'];
+webauthn_add_credential('bob', 'k', make_reg($rp), $rp);        /* another request saves a passkey */
+$GLOBALS['test_config'] = $stale;                                 /* this request still has the older copy */
+@unlink("$dir/notices.log");
+function parse_xml_config($file, $root) {
+	return unserialize(file_get_contents(RACE_DISK));
+}
+function g_get($k) {
+	return ['conf_path' => '/cf/conf', 'xml_rootobj' => 'pfsense'][$k];
+}
+check(!webauthn_check_config_state() && !file_exists("$dir/notices.log"), 'N4 an older copy in memory after a save by this package: no alarm');
+check(webauthn_config_hash(['item' => [], 'config' => [['enable' => '']]]) === webauthn_config_hash(['config' => [['enable' => '']]]) &&
+    webauthn_config_hash(['x' => 1]) === webauthn_config_hash(['x' => '1']), 'N4 hash ignores empty lists and value types (as config.xml stores them)');
+/* N3: a state file that cannot be written does not raise a notice on every request. */
+$GLOBALS['test_config']['installedpackages']['webauthn']['config'][0]['enforce'] = '';
+write_config('outside change');
+@mkdir(WEBAUTHN_STATE_FILE . '.' . getmypid() . '.tmp');
+for ($i = 0; $i < 4; $i++) {
+	webauthn_check_config_state();
+}
+@rmdir(WEBAUTHN_STATE_FILE . '.' . getmypid() . '.tmp');
+check(substr_count((string)@file_get_contents("$dir/notices.log"), 'changed outside') === 1, 'N3 unwritable state file: one notice, not one per request');
 $gate = file_get_contents(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/gate.inc');
 check(strpos($gate, 'webauthn_check_config_state();') < strpos($gate, "if (empty(\$settings['enable']))"),
     'R4-M the gate checks before it looks at the enable setting');

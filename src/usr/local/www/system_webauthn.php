@@ -53,7 +53,7 @@ if ($_POST['act'] == 'register') {
 	if ($username === '') {
 		$input_errors[] = gettext('Your account could not be found in the user database.');
 	} elseif (!webauthn_registrable_name($_SESSION)) {
-		$input_errors[] = gettext('Passkeys cannot be registered under this spelling of your username. Sign in with your plain account name.');
+		$input_errors[] = gettext('Passkeys cannot be registered under this spelling of your username (it contains a backslash or a slash). Sign in with your plain account name, then register.');
 	} elseif (!$may_register) {
 		$input_errors[] = gettext('You already have a passkey: sign in with it (through a non-trusted path) before adding another.');
 	} elseif (!webauthn_valid_passkey_name($name)) {
@@ -62,19 +62,18 @@ if ($_POST['act'] == 'register') {
 		$input_errors[] = gettext('Configure an RP ID on the Settings tab first.');
 	} else {
 		try {
-			/* The challenge counts as used only once the passkey is verified and saved. */
-			$reg = webauthn_use_challenge('register', $username, $client_data,
-			    function ($challenge) use ($client_data, $attestation, $settings, $username, $name, $uid) {
-				$reg = webauthn_verify_registration($client_data, $attestation, $challenge, webauthn_rp_id($settings),
+			/* The challenge counts as used once the response verified (per-account limit), before
+			 * the config is saved: saving must not hold the lock every sign-in needs. */
+			$reg = webauthn_use_challenge('register', $username, $client_data, function ($challenge) use ($client_data, $attestation, $settings) {
+				return webauthn_verify_registration($client_data, $attestation, $challenge, webauthn_rp_id($settings),
 				    webauthn_allowed_origins($settings), webauthn_require_uv($settings));
-				$error = webauthn_add_credential($username, $name, $reg, webauthn_rp_id($settings), $uid);
-				if ($error !== null) {
-					throw new WebAuthnException($error);
-				}
-				return $reg;
 			});
 			if ($reg === null) {
 				throw new WebAuthnException(gettext('The registration request expired or was already used. Try again.'));
+			}
+			$error = webauthn_add_credential($username, $name, $reg, webauthn_rp_id($settings), $uid, webauthn_registration_exact($_SESSION));
+			if ($error !== null) {
+				throw new WebAuthnException($error);
 			}
 			/* Holding a passkey just proven to the server satisfies the gate; new session ID as after a passkey sign-in. */
 			session_regenerate_id(true);
