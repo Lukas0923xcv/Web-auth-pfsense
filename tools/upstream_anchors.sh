@@ -2,9 +2,9 @@
 # Check the WebAuthn hooks against pfSense's own copies of the patched
 # files (authgui.inc, auth_check.inc, xmlrpc.php):
 #
-#   sh tools/upstream_anchors.sh release   the files pfSense CE 2.8.1 ships, from
-#                                          the pfSense-base package of the official
-#                                          2.8.1 repository
+#   sh tools/upstream_anchors.sh release   the files pfSense CE 2.8.1 ships, from the
+#                                          pfSense package of the official 2.8.1
+#                                          package repository
 #   sh tools/upstream_anchors.sh master    pfsense/pfsense's default branch on GitHub
 #
 # pfsense/pfsense on GitHub has no tag or branch for 2.8.x (its tags stop
@@ -37,13 +37,24 @@ release)
 	repo=$PFSENSE_REPO
 	curl -fsSL --retry 3 -o "$dir/packagesite.pkg" "$repo/packagesite.pkg"
 	tar -xf "$dir/packagesite.pkg" -C "$dir" packagesite.yaml
-	path=$(grep '"name":"pfSense-base"' "$dir/packagesite.yaml" | head -n 1 | sed 's/.*"repopath":"\([^"]*\)".*/\1/')
-	version=$(grep '"name":"pfSense-base"' "$dir/packagesite.yaml" | head -n 1 | sed 's/.*"version":"\([^"]*\)".*/\1/')
-	[ -n "$path" ] || { echo "pfSense-base not found in $repo"; exit 1; }
-	echo "pfSense-base $version from $repo/$path"
-	curl -fsSL --retry 3 -o "$dir/base.pkg" "$repo/$path"
-	mkdir "$dir/x"
-	tar -xf "$dir/base.pkg" -C "$dir/x" --wildcards '*etc/inc/authgui.inc' '*etc/inc/auth_check.inc' '*usr/local/www/xmlrpc.php'
+	# The GUI's PHP files are in the "pfSense" package; look in pfSense-base too.
+	found=0
+	for name in pfSense pfSense-base; do
+		line=$(grep "\"name\":\"$name\"," "$dir/packagesite.yaml" | head -n 1)
+		[ -n "$line" ] || continue
+		path=$(echo "$line" | sed 's/.*"repopath":"\([^"]*\)".*/\1/')
+		version=$(echo "$line" | sed 's/.*"version":"\([^"]*\)".*/\1/')
+		curl -fsSL --retry 3 -o "$dir/pkg" "$repo/$path"
+		if tar -tf "$dir/pkg" | grep -q 'etc/inc/authgui\.inc$'; then
+			echo "$name $version from $repo/$path"
+			mkdir -p "$dir/x"
+			tar -xf "$dir/pkg" -C "$dir/x" --wildcards '*etc/inc/authgui.inc' '*etc/inc/auth_check.inc' '*usr/local/www/xmlrpc.php'
+			found=1
+			break
+		fi
+		echo "$name $version: no etc/inc/authgui.inc in it"
+	done
+	[ "$found" = 1 ] || { echo "authgui.inc not found in the 2.8.1 packages of $repo"; exit 1; }
 	for f in authgui.inc auth_check.inc xmlrpc.php; do
 		find "$dir/x" -name "$f" -exec cp {} "$dir/$f" \;
 	done
