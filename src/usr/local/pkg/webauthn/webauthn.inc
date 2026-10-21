@@ -40,6 +40,10 @@ if (!defined('WEBAUTHN_CONFIG_LOCK')) {
 if (!defined('WEBAUTHN_NOTICE_FILE')) {
 	define('WEBAUTHN_NOTICE_FILE', '/conf/webauthn_notices.json');
 }
+if (!defined('WEBAUTHN_RUN_DIR')) {
+	/* Fallback markers when /conf cannot be written (cleared at reboot). */
+	define('WEBAUTHN_RUN_DIR', '/var/run');
+}
 if (!defined('WEBAUTHN_STATE_FILE')) {
 	/* Hash of installedpackages/webauthn as last saved by this package. */
 	define('WEBAUTHN_STATE_FILE', '/conf/webauthn_state.json');
@@ -266,17 +270,6 @@ function webauthn_registrable_name(array $session): bool {
 	return webauthn_session_is_local($session) || (!str_contains($u, '\\') && !str_contains($u, '/'));
 }
 
-/*
- * Must a passkey registered by this session stand for its exact name
- * only (see webauthn_credential_keys())? For LDAP names the server does
- * not shorten: with ldap_nostrip_at an "@", and "%" in any case.
- */
-function webauthn_registration_exact(array $session): bool {
-	$nostrip = webauthn_ldap_nostrip($session);
-	$u = webauthn_session_identity($session);
-	return $nostrip !== null && (($nostrip && str_contains($u, '@')) || str_contains($u, '%'));
-}
-
 /* Passkeys registered under another spelling of the sign-in name $username (see webauthn_username_keys()). */
 function webauthn_case_variant_credentials(string $username): array {
 	$out = [];
@@ -292,19 +285,13 @@ function webauthn_case_variant_credentials(string $username): array {
 }
 
 /*
- * The names a stored passkey stands for. A passkey marked 'exact' was
- * registered under a name its backend does not shorten (LDAP with
- * ldap_nostrip_at, or a "%" in an LDAP name): only that name and its
- * case/width variants count, so "carol@corp.com" does not stand for a
- * different account "carol".
+ * The names a stored passkey stands for: every spelling a backend may
+ * take for its owner (see webauthn_username_keys()). Deliberately broad:
+ * a passkey that stands for too many names can only refuse someone, one
+ * that stands for too few lets another spelling skip the passkey step.
  */
 function webauthn_credential_keys(array $c): array {
-	$name = webauthn_normalize_username($c['username'] ?? '');
-	if (!empty($c['exact'])) {
-		$k = webauthn_username_fold($name);
-		return $k === '' ? [] : [$k];
-	}
-	return webauthn_username_keys($name, false);
+	return webauthn_username_keys(webauthn_normalize_username($c['username'] ?? ''), false);
 }
 
 /* Split a whitespace/comma separated list, dropping empties. */
@@ -714,7 +701,7 @@ function webauthn_notice(string $message, ?string $rate_key = null): void {
 
 /* Record that a notice for $key is raised now; false if one was raised recently. */
 function webauthn_notice_due(string $key): bool {
-	return webauthn_with_lock(WEBAUTHN_NOTICE_FILE, function () use ($key) {
+	$due = webauthn_with_lock(WEBAUTHN_NOTICE_FILE, function () use ($key) {
 		$now = time();
 		$data = json_decode((string)@file_get_contents(WEBAUTHN_NOTICE_FILE), true);
 		$data = is_array($data) ? $data : [];
@@ -726,9 +713,25 @@ function webauthn_notice_due(string $key): bool {
 			return false;
 		}
 		$data[$k] = $now;
-		webauthn_write_json(WEBAUTHN_NOTICE_FILE, $data);
-		return true;
-	}, true);
+		if (webauthn_write_json(WEBAUTHN_NOTICE_FILE, $data)) {
+			return true;
+		}
+		/* /conf cannot be written (full disk): rate limit with a marker in
+		 * WEBAUTHN_RUN_DIR instead; without one, raise no notice at all
+		 * rather than one per request. */
+		return webauthn_run_marker_due('notice_' . substr($k, 0, 32));
+	}, null);
+	return $due ?? webauthn_run_marker_due('notice_' . substr(hash('sha256', $key), 0, 32));
+}
+
+/* True (and the marker set) if marker $name in WEBAUTHN_RUN_DIR is absent or older than WEBAUTHN_NOTICE_INTERVAL. */
+function webauthn_run_marker_due(string $name): bool {
+	$f = WEBAUTHN_RUN_DIR . '/webauthn_' . $name;
+	clearstatcache(true, $f);
+	if (file_exists($f) && time() - (int)@filemtime($f) < WEBAUTHN_NOTICE_INTERVAL) {
+		return false;
+	}
+	return @touch($f);
 }
 
 /*
@@ -865,7 +868,14 @@ function webauthn_check_config_state(): bool {
 	if (is_array($data) && ($data['hash'] ?? null) === webauthn_config_hash()) {
 		return false;
 	}
-	$changed = webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () {
+	/* The state could not be recorded recently (full /conf): do not parse
+	 * config.xml under the lock on every request; try again later. */
+	$retry = WEBAUTHN_RUN_DIR . '/webauthn_state_retry';
+	clearstatcache(true, $retry);
+	if (file_exists($retry) && time() - (int)@filemtime($retry) < WEBAUTHN_NOTICE_INTERVAL) {
+		return false;
+	}
+	$changed = webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () use ($retry) {
 		$data = json_decode((string)@file_get_contents(WEBAUTHN_STATE_FILE), true);
 		$known = is_array($data) && isset($data['hash']);
 		/* This request may simply have loaded the config before the last
@@ -875,7 +885,9 @@ function webauthn_check_config_state(): bool {
 		if ($known && $data['hash'] === $now) {
 			return false;
 		}
-		webauthn_write_json(WEBAUTHN_STATE_FILE, ['hash' => $now, 'time' => time()]);
+		if (!webauthn_write_json(WEBAUTHN_STATE_FILE, ['hash' => $now, 'time' => time()])) {
+			@touch($retry);
+		}
 		return $known;
 	}, false);
 	if ($changed) {
@@ -912,10 +924,10 @@ function webauthn_config_reload(): bool {
  * Store a new passkey. Returns null on success, or an error message.
  * $uid: the pfSense uid of a local account, '' for remote accounts.
  */
-function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id, string $uid = '', bool $exact = false): ?string {
+function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id, string $uid = ''): ?string {
 	$id = webauthn_b64url_encode($reg['credential_id']);
 	$error = null;
-	$ok = webauthn_config_update(function () use ($username, $name, $reg, $rp_id, $uid, $exact, $id, &$error) {
+	$ok = webauthn_config_update(function () use ($username, $name, $reg, $rp_id, $uid, $id, &$error) {
 		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
 		$all = is_array($all) ? array_values(array_filter(isset($all['id']) && !is_array($all['id']) ? [$all] : $all, 'is_array')) : [];
 		$revoked = webauthn_revoked_ids();
@@ -959,9 +971,6 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 		];
 		if ($uid !== '') {
 			$rec['uid'] = $uid;
-		}
-		if ($exact) {
-			$rec['exact'] = 'yes';
 		}
 		$all[] = $rec;
 		config_set_path(WEBAUTHN_CRED_PATH, $all);

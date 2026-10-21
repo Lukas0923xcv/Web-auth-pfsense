@@ -17,6 +17,8 @@ define('WEBAUTHN_USED_FILE', "$tmp/webauthn-test-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-test-revoked.json");
 define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-test-config");
 define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-test-notices.json");
+define('WEBAUTHN_STATE_FILE', "$tmp/webauthn-test-state.json");
+define('WEBAUTHN_RUN_DIR', $tmp);
 
 function config_get_path($path, $default = null) {
 	$c = $GLOBALS['test_config'];

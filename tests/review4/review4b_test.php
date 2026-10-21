@@ -85,17 +85,23 @@ check(!webauthn_registrable_name(['Username' => "eve\x01"] + $ldap) && !webauthn
 check(!webauthn_registrable_name(['Username' => 'x/carol'] + $ldap) && !webauthn_registrable_name(['Username' => 'x\\carol', 'authsource' => 'RADIUS/r']) &&
     !webauthn_registrable_name(['Username' => 'x/carol', 'authsource' => 'RADIUS/r']), 'R4-J ...nor "\\" or "/" names through LDAP or RADIUS');
 check(webauthn_registrable_name(['Username' => 'carol@realm', 'authsource' => 'RADIUS/r']), 'R4-J RADIUS user@realm names can');
-check(!webauthn_registration_exact(['Username' => 'alice@corp'] + $ldap), 'R4-J stripped "@": passkey also stands for "alice"');
 setup_disk($settings, [], ['system' => ['authserver' => [['name' => 'corp', 'type' => 'ldap', 'ldap_nostrip_at' => '']]]]);
 check(webauthn_ldap_account(['Username' => 'alice@corp'] + $ldap) === 'alice@corp', 'R4-J ldap_nostrip_at respected');
-/* N2: with ldap_nostrip_at, "@" names can register, and stand for themselves only. */
-check(webauthn_registrable_name(['Username' => 'carol@corp.com'] + $ldap) && webauthn_registration_exact(['Username' => 'carol@corp.com'] + $ldap),
-    'N2 nostrip: "carol@corp.com" can register, as an exact name');
-check(webauthn_add_credential('carol@corp.com', 'k', make_reg($rp), $rp, '', true) === null, 'N2 setup: registered');
-check(webauthn_session_status($settings, ['Username' => 'carol'] + $ldap, $tunnel) === 'deny',
-    'N2 the different account "carol" is not taken for its owner (no passkey: Enforce refuses as usual)');
+/* N2: with ldap_nostrip_at, "@" names can register. */
+check(webauthn_registrable_name(['Username' => 'carol@corp.com'] + $ldap), 'N2 nostrip: "carol@corp.com" can register');
+check(webauthn_add_credential('carol@corp.com', 'k', make_reg($rp), $rp) === null, 'N2 setup: registered');
 check(webauthn_session_status($settings, ['Username' => 'CAROL@corp.com'] + $ldap, $tunnel) === 'require',
-    'N2 a case variant of the exact name still needs its passkey');
+    'N2 a case variant of the name needs its passkey');
+/* C1: every spelling the backend may take for the owner still needs the passkey (Enforce off). */
+$off = array_merge($settings, ['enforce' => '']);
+setup_disk($off, [], ['system' => ['authserver' => [['name' => 'corp', 'type' => 'ldap']]]]);
+foreach (['carol@x%y' => ['carol', 'Carol@other'], 'carol%ops' => ['carol%ops@corp']] as $owner => $logins) {
+	webauthn_add_credential($owner, 'k', make_reg($rp), $rp);
+	foreach ($logins as $login) {
+		$st = webauthn_session_status($off, ['Username' => $login] + $ldap, $tunnel);
+		check($st === 'require', "C1 owner '$owner', sign-in '$login': passkey step not skipped (got $st)");
+	}
+}
 
 /* ---- R4-K: the used-challenge list cannot be filled by one account ---- */
 reset_dir($dir);
@@ -183,6 +189,7 @@ webauthn_add_credential('bob', 'k', make_reg($rp), $rp);        /* another reque
 $GLOBALS['test_config'] = $stale;                                 /* this request still has the older copy */
 @unlink("$dir/notices.log");
 function parse_xml_config($file, $root) {
+	$GLOBALS['parses'] = ($GLOBALS['parses'] ?? 0) + 1;
 	return unserialize(file_get_contents(RACE_DISK));
 }
 function g_get($k) {
@@ -191,15 +198,19 @@ function g_get($k) {
 check(!webauthn_check_config_state() && !file_exists("$dir/notices.log"), 'N4 an older copy in memory after a save by this package: no alarm');
 check(webauthn_config_hash(['item' => [], 'config' => [['enable' => '']]]) === webauthn_config_hash(['config' => [['enable' => '']]]) &&
     webauthn_config_hash(['x' => 1]) === webauthn_config_hash(['x' => '1']), 'N4 hash ignores empty lists and value types (as config.xml stores them)');
-/* N3: a state file that cannot be written does not raise a notice on every request. */
+/* N3/C2: with /conf full (state and notice files unwritable), no notice storm and no parse per request. */
 $GLOBALS['test_config']['installedpackages']['webauthn']['config'][0]['enforce'] = '';
 write_config('outside change');
 @mkdir(WEBAUTHN_STATE_FILE . '.' . getmypid() . '.tmp');
-for ($i = 0; $i < 4; $i++) {
+@mkdir(WEBAUTHN_NOTICE_FILE . '.' . getmypid() . '.tmp');
+$GLOBALS['parses'] = 0;
+for ($i = 0; $i < 10; $i++) {
 	webauthn_check_config_state();
 }
 @rmdir(WEBAUTHN_STATE_FILE . '.' . getmypid() . '.tmp');
-check(substr_count((string)@file_get_contents("$dir/notices.log"), 'changed outside') === 1, 'N3 unwritable state file: one notice, not one per request');
+@rmdir(WEBAUTHN_NOTICE_FILE . '.' . getmypid() . '.tmp');
+check(substr_count((string)@file_get_contents("$dir/notices.log"), 'changed outside') === 1, 'C2 full /conf: one notice in 10 requests');
+check($GLOBALS['parses'] === 1, "C2 full /conf: config.xml parsed once, not on every request ({$GLOBALS['parses']})");
 $gate = file_get_contents(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/gate.inc');
 check(strpos($gate, 'webauthn_check_config_state();') < strpos($gate, "if (empty(\$settings['enable']))"),
     'R4-M the gate checks before it looks at the enable setting');

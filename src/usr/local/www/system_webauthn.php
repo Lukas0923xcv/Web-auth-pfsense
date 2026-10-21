@@ -71,7 +71,7 @@ if ($_POST['act'] == 'register') {
 			if ($reg === null) {
 				throw new WebAuthnException(gettext('The registration request expired or was already used. Try again.'));
 			}
-			$error = webauthn_add_credential($username, $name, $reg, webauthn_rp_id($settings), $uid, webauthn_registration_exact($_SESSION));
+			$error = webauthn_add_credential($username, $name, $reg, webauthn_rp_id($settings), $uid);
 			if ($error !== null) {
 				throw new WebAuthnException($error);
 			}

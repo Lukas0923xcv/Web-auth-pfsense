@@ -76,11 +76,20 @@ R4-I, R4-J (LDAP) and R4-K were confirmed fixed by re-running the reproductions.
 | Finding | Fix | Test |
 |---|---|---|
 | N1 Registration saved the config while holding the used-challenge lock that every passkey sign-in needs; a failing registration (duplicate ID, passkey cap) could be resent for 300 s and stall everyone's sign-in for the length of each config save. | The challenge is checked and recorded under the lock (counted per account), the passkey is saved after the lock is released. Challenges wasted that way count only against the attacker's own account limit. | review4b N1 |
-| N2 With `ldap_nostrip_at`, users whose name contains "@" could not register at all. | They can; their passkeys are marked `exact` and stand only for that name (and its case/width variants), so `carol@corp.com` never shadows a different account `carol`. Same for "%" in LDAP names. | review4b N2 |
+| N2 With `ldap_nostrip_at`, users whose name contains "@" could not register at all. | They can (the LDAP rule became "no `\` or `/`", see the R4-J row below). | review4b N2 |
 | N3 If the state file could not be written, every GUI request raised a notice and an e-mail. | The outside-change notice is rate limited (15 minutes). | review4b N3 |
 | N4 False "changed outside" alarms: a request that had loaded the config just before this package saved; and the hash differed after config.xml dropped an empty list. | On a difference, the section on disk is compared (pfSense's `parse_xml_config()`), and the hash ignores empty lists and value types. | review4b N4 |
 | R4-J for RADIUS: a server that authenticates the part before "\" or "/" would let `x\carol` shadow carol. | Remote names with "\" or "/" cannot hold passkeys (sign in with the plain name to register). | review4b R4-J |
 | Passkeys of a deleted account counted towards the 20-passkey limit of a new account with that name. | Orphaned records are not counted. | review4b R4-K |
+
+### Third independent pass (state 51b7bff)
+
+F1–F3, N1, N2 and N4 confirmed fixed. Two findings in the second-pass fixes:
+
+| Finding | Fix | Test |
+|---|---|---|
+| C1 (low/medium) The `exact` marker from the first N2 fix made passkeys of LDAP names with "%" stand for their full name only, while pfSense still authenticated shorter spellings (`carol` for `carol@x%y`): with Enforce off those spellings skipped the passkey step again. | `exact` removed. A passkey stands for every spelling a backend may take for its owner; standing for too many names can only refuse someone. The price, documented: with `ldap_nostrip_at` and two distinct accounts `carol` and `carol@corp.com`, a passkey of the second also stops the first until an admin removes it. | review4b C1 (the three reported spellings) |
+| C2 (low) With /conf full, the notice rate limit did not hold (its own write failed) and every GUI request parsed config.xml under the config lock. | The notice limit falls back to a marker in `/var/run`; without one no notice is raised rather than one per request. If the state cannot be recorded, the disk comparison pauses for 15 minutes (`/var/run/webauthn_state_retry`). | review4b C2 |
 
 Kept as documented limits (README): unprotected windows while a pfSense upgrade or a removed boot command and cron job leave a hook missing (the hook cannot run when it is not there; a notice is raised when patching fails); name equivalences of LDAP/RADIUS servers beyond the folding rules, for which Enforce is the answer.
 

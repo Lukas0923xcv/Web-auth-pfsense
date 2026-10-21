@@ -12,6 +12,8 @@ define('WEBAUTHN_USED_FILE', "$tmp/webauthn-r4f-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-r4f-revoked.json");
 define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-r4f-config");
 define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-r4f-notices.json");
+define('WEBAUTHN_STATE_FILE', "$tmp/webauthn-r4f-state.json");
+define('WEBAUTHN_RUN_DIR', $tmp);
 @unlink(WEBAUTHN_REVOKED_FILE);
 
 /* As in pfSense: the config lives in $GLOBALS['config']. */

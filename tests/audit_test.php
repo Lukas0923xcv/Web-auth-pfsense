@@ -12,6 +12,8 @@ define('WEBAUTHN_USED_FILE', "$tmp/webauthn-audit-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-audit-revoked.json");
 define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-audit-config");
 define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-audit-notices.json");
+define('WEBAUTHN_STATE_FILE', "$tmp/webauthn-audit-state.json");
+define('WEBAUTHN_RUN_DIR', $tmp);
 @unlink(WEBAUTHN_REVOKED_FILE);
 @unlink(WEBAUTHN_NOTICE_FILE);
 
@@ -119,6 +121,8 @@ define("WEBAUTHN_COUNTER_FILE", ' . var_export("$tmp/webauthn-audit-count.json",
 define("WEBAUTHN_KEY_FILE", ' . var_export("$tmp/webauthn-audit.key", true) . ');
 define("WEBAUTHN_USED_FILE", ' . var_export("$tmp/webauthn-audit-used.json", true) . ');
 define("WEBAUTHN_REVOKED_FILE", ' . var_export("$tmp/webauthn-audit-revoked.json", true) . ');
+define("WEBAUTHN_STATE_FILE", ' . var_export("$tmp/webauthn-audit-state.json", true) . ');
+define("WEBAUTHN_RUN_DIR", ' . var_export($tmp, true) . ');
 $GLOBALS["cfg"] = ' . var_export($config, true) . ';
 $_SESSION = ' . var_export($session, true) . ';
 $_SERVER = array_merge($_SERVER, ' . var_export($server + ['REQUEST_URI' => '/getstats.php'], true) . ');

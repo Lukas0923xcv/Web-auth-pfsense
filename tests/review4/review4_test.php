@@ -10,6 +10,8 @@ define('WEBAUTHN_USED_FILE', "$tmp/webauthn-r4-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-r4-revoked.json");
 define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-r4-config");
 define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-r4-notices.json");
+define('WEBAUTHN_STATE_FILE', "$tmp/webauthn-r4-state.json");
+define('WEBAUTHN_RUN_DIR', $tmp);
 foreach ([WEBAUTHN_COUNTER_FILE, WEBAUTHN_USED_FILE, WEBAUTHN_REVOKED_FILE, WEBAUTHN_NOTICE_FILE] as $f) {
 	@unlink($f);
 }

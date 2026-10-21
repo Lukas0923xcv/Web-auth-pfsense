@@ -12,6 +12,7 @@ define('WEBAUTHN_REVOKED_FILE', "$D/revoked.json");
 define('WEBAUTHN_CONFIG_LOCK', "$D/config");
 define('WEBAUTHN_NOTICE_FILE', "$D/notices.json");
 define('WEBAUTHN_STATE_FILE', "$D/state.json");
+define('WEBAUTHN_RUN_DIR', "$D");
 define('RACE_DISK', "$D/config.ser");
 $GLOBALS['test_config'] = file_exists(RACE_DISK) ? unserialize(file_get_contents(RACE_DISK)) : [];
 function config_get_path($path, $default = null) {
