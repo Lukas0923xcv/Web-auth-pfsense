@@ -551,10 +551,12 @@ function webauthn_find_credential(string $username, string $id): ?array {
  * account counts as locked (fail closed) until the file is repaired or
  * removed.
  *
- * The limit is per client address, not for the whole account: anyone who
- * knows the password could otherwise keep the real user locked out by
- * failing on purpose (review finding F1). The account-wide total only
- * raises a notice.
+ * The hard limit is per client address (IPv6: per /64), not for the
+ * whole account: anyone who knows the password could otherwise keep the
+ * real user locked out by failing on purpose (review finding F1). Over all
+ * addresses, an account with WEBAUTHN_MAX_ACCOUNT_FAILURES failures in the
+ * window is throttled to one attempt per WEBAUTHN_ACCOUNT_THROTTLE seconds,
+ * so changing addresses does not give unlimited attempts either.
  * @return array<string, array{n: int, t: int, u: string}>|null
  */
 function webauthn_read_failures(int $now): ?array {
@@ -585,12 +587,52 @@ function webauthn_failure_user_hash(string $user): string {
 }
 
 function webauthn_failure_key(string $user, string $client): string {
-	return substr(hash('sha256', webauthn_normalize_username($user) . "\0" . $client), 0, 32);
+	return substr(hash('sha256', webauthn_normalize_username($user) . "\0" . webauthn_failure_address($client)), 0, 32);
+}
+
+/* The address attempts are counted under: IPv4 as it is, IPv6 by its /64 (one host usually has a whole /64). */
+function webauthn_failure_address(string $client): string {
+	$bin = @inet_pton($client);
+	if ($bin === false || strlen($bin) != 16) {
+		return $client;
+	}
+	return inet_ntop(substr($bin, 0, 8) . str_repeat("\0", 8)) . '/64';
+}
+
+/**
+ * The account-wide picture: attempts from all addresses in the window, and
+ * the time of the latest.
+ * @param array<string, array{n: int, t: int, u: string}> $data
+ * @return array{0: int, 1: int}
+ */
+function webauthn_failure_account(array $data, string $user): array {
+	$total = 0;
+	$last = 0;
+	foreach ($data as $e) {
+		if ($e['u'] === webauthn_failure_user_hash($user)) {
+			$total += $e['n'];
+			$last = max($last, $e['t']);
+		}
+	}
+	return [$total, $last];
+}
+
+/**
+ * Seconds until the account takes another attempt under the account-wide throttle; 0 if it does now.
+ * @param array<string, array{n: int, t: int, u: string}> $data
+ */
+function webauthn_failure_throttle_remaining(array $data, string $user, int $now): int {
+	[$total, $last] = webauthn_failure_account($data, $user);
+	if ($total < WEBAUTHN_MAX_ACCOUNT_FAILURES || $now - $last >= WEBAUTHN_ACCOUNT_THROTTLE) {
+		return 0;
+	}
+	return max(1, $last + WEBAUTHN_ACCOUNT_THROTTLE - $now);
 }
 
 /*
- * Seconds until $user may try a passkey again from $client; 0 if they may
- * now. A damaged attempt list counts as locked for the whole window.
+ * Seconds until $user may try a passkey again from $client (the address
+ * lock or the account-wide throttle); 0 if they may now. A damaged attempt
+ * list counts as locked for the whole window.
  */
 function webauthn_failure_lock_remaining(string $user, string $client): int {
 	$now = time();
@@ -598,20 +640,17 @@ function webauthn_failure_lock_remaining(string $user, string $client): int {
 	if ($data === null) {
 		return WEBAUTHN_FAILURE_WINDOW;
 	}
+	$throttle = webauthn_failure_throttle_remaining($data, $user, $now);
 	$e = $data[webauthn_failure_key($user, $client)] ?? null;
 	if ($e === null || $e['n'] < WEBAUTHN_MAX_USER_FAILURES) {
-		return 0;
+		return $throttle;
 	}
-	return max(1, $e['t'] + WEBAUTHN_FAILURE_WINDOW - $now);
+	return max($throttle, 1, $e['t'] + WEBAUTHN_FAILURE_WINDOW - $now);
 }
 
 /* Failed attempts for $user from all addresses in the window (for the notice). */
 function webauthn_failure_account_total(string $user): int {
-	$total = 0;
-	foreach (webauthn_read_failures(time()) ?? [] as $e) {
-		$total += ($e['u'] === webauthn_failure_user_hash($user)) ? $e['n'] : 0;
-	}
-	return $total;
+	return webauthn_failure_account(webauthn_read_failures(time()) ?? [], $user)[0];
 }
 
 /*
@@ -631,7 +670,7 @@ function webauthn_failure_begin(string $user, string $client): bool {
 		}
 		$k = webauthn_failure_key($user, $client);
 		$n = $data[$k]['n'] ?? 0;
-		if ($n >= WEBAUTHN_MAX_USER_FAILURES) {
+		if ($n >= WEBAUTHN_MAX_USER_FAILURES || webauthn_failure_throttle_remaining($data, $user, $now) > 0) {
 			return false;
 		}
 		$data[$k] = ['n' => $n + 1, 't' => $now, 'u' => webauthn_failure_user_hash($user)];

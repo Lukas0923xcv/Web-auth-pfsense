@@ -152,7 +152,7 @@ if ($tab == 'passkeys' && webauthn_rp_id($settings) !== '' && $may_register) {
 		'challenge' => webauthn_b64url_encode(webauthn_new_challenge('register', $username)),
 		'rp' => ['id' => webauthn_rp_id($settings), 'name' => g_get('product_label') . ' ' . config_get_path('system/hostname')],
 		'user' => [
-			'id' => webauthn_b64url_encode(hash('sha256', 'pfsense-webauthn:' . $username, true)),
+			'id' => webauthn_b64url_encode(webauthn_user_handle($username)),
 			'name' => $username,
 			'displayName' => $username,
 		],

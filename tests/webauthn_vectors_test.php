@@ -101,7 +101,8 @@ throws(fn() => $reg('not json', $att), '7.1 step 6: clientDataJSON must be JSON'
 throws(fn() => $reg($cd_with($cd, ['type' => 'webauthn.get']), $att), '7.1 step 7: type must be webauthn.create', 'ceremony type');
 throws(fn() => $reg($cd_with($cd, ['challenge' => webauthn_b64url_encode(random_bytes(32))]), $att), '7.1 step 8: challenge', 'Challenge');
 throws(fn() => $reg($cd_with($cd, ['origin' => 'https://evil.example']), $att), '7.1 step 9: origin', 'Origin');
-throws(fn() => $reg($cd_with($cd, ['crossOrigin' => true]), $att), '7.1 step 10: crossOrigin / topOrigin', 'Cross-origin');
+throws(fn() => $reg($cd_with($cd, ['crossOrigin' => true]), $att), '7.1 step 10: crossOrigin', 'Cross-origin');
+throws(fn() => $reg($cd_with($cd, ['topOrigin' => $origin]), $att), '7.1 step 10: topOrigin (cross-origin iframe)', 'Cross-origin');
 throws(fn() => $reg($cd, "\xa1\x63fmt\x64none"), '7.1 step 12: attestationObject must hold authData', 'no authData');
 throws(fn() => $reg($cd, substr($att, 0, -3)), '7.1 step 12: attestationObject must decode', 'Invalid attestationObject');
 throws(fn() => $reg($cd, $att, false, 'example.org'), '7.1 step 13: rpIdHash', 'RP ID hash');
@@ -155,7 +156,8 @@ throws(fn() => $get('{', $ad, $sig), '7.2 step 10: clientDataJSON must be JSON',
 throws(fn() => $get($cd_with($cd, ['type' => 'webauthn.create']), $ad, $sig), '7.2 step 11: type must be webauthn.get', 'ceremony type');
 throws(fn() => $get($cd_with($cd, ['challenge' => webauthn_b64url_encode(random_bytes(32))]), $ad, $sig), '7.2 step 12: challenge', 'Challenge');
 throws(fn() => $get($cd_with($cd, ['origin' => 'https://evil.example']), $ad, $sig), '7.2 step 13: origin', 'Origin');
-throws(fn() => $get($cd_with($cd, ['crossOrigin' => true]), $ad, $sig), '7.2 step 14: crossOrigin / topOrigin', 'Cross-origin');
+throws(fn() => $get($cd_with($cd, ['crossOrigin' => true]), $ad, $sig), '7.2 step 14: crossOrigin', 'Cross-origin');
+throws(fn() => $get($cd_with($cd, ['topOrigin' => $v['origin']]), $ad, $sig), '7.2 step 14: topOrigin (cross-origin iframe)', 'Cross-origin');
 throws(fn() => $get($cd, substr($ad, 0, 36), $sig), '7.2 step 15: authenticator data must parse', 'too short');
 throws(fn() => $get($cd, $ad, $sig, false, null, 'example.org'), '7.2 step 15: rpIdHash', 'RP ID hash');
 throws(fn() => $get($cd, $flags($ad, 0, WEBAUTHN_FLAG_UP), $sig), '7.2 step 16: UP must be set', 'User presence');
@@ -174,10 +176,20 @@ throws(fn() => $get($cd, $ad, $sig, false, ['alg' => WEBAUTHN_ALG_EDDSA] + $cred
 [$rsa, $rv] = $stored['RS256'];
 throws(fn() => webauthn_verify_assertion(['alg' => WEBAUTHN_ALG_ES256] + $rsa, d($rv['clientDataJSON']), d($rv['authenticatorData']),
     d($rv['signature']), d($rv['challenge']), $rv['rp_id'], [$rv['origin']], false), '7.2 step 21: stored ES256 with an RSA key refused', 'Signature verification');
+/* Step 6: response.userHandle, when sent, must be the account's user.id (the real RSA vector carries one). */
+$uh = d($rv['userHandle']);
+$rsa_get = function ($expected, $handle) use ($rsa, $rv) {
+	return webauthn_verify_assertion($rsa, d($rv['clientDataJSON']), d($rv['authenticatorData']), d($rv['signature']),
+	    d($rv['challenge']), $rv['rp_id'], [$rv['origin']], false, $info, $handle, $expected);
+};
+check($rsa_get($uh, $uh) === $rv['new_sign_count'], '7.2 step 6: matching userHandle accepted');
+throws(fn() => $rsa_get(hash('sha256', 'pfsense-webauthn:someone-else', true), $uh), '7.2 step 6: userHandle of another account', 'User handle');
+throws(fn() => $rsa_get(null, $uh), '7.2 step 6: userHandle sent but no account expected', 'User handle');
+check($rsa_get($uh, '') === $rv['new_sign_count'], '7.2 step 6: no userHandle sent (allowCredentials given): accepted');
 /*
- * Steps 5-6 (the credential is one of allowCredentials and belongs to the
- * signed-in user) are checked by webauthn_find_credential() in the gate:
- * tests/gate_flow_test.php and tests/gate_ldap_and_revocation_test.php.
+ * Step 5 (the credential is one the signed-in account owns) is checked by
+ * webauthn_find_credential() in the gate: tests/gate_flow_test.php
+ * ("another user's passkey is refused").
  */
 
 echo "$count checks, $failures failed\n";

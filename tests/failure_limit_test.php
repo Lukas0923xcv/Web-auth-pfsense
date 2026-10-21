@@ -170,6 +170,51 @@ req($state, ['server' => $tunnel]);
 $r = req($state, ['server' => $tunnel, 'sign' => $sign]);
 check(($r['webauthn']['method'] ?? null) === 'webauthn', 'another locked account does not lock this one');
 
+/* ---- Changing addresses does not give unlimited attempts: account-wide throttle ---- */
+const MAX_ACCOUNT_FAILURES = 30;
+const ACCOUNT_THROTTLE = 20;
+@unlink($failure_file);
+setup($state, $settings);
+for ($i = 1; $i <= MAX_ACCOUNT_FAILURES; $i++) {
+	$from = ['REMOTE_ADDR' => '192.168.1.5', 'HTTP_CF_CONNECTING_IP' => "198.18.0.$i"];
+	new_session($state);
+	req($state, ['server' => $from]);
+	req($state, ['server' => $from, 'sign' => $sign + ['tamper' => true]]);
+}
+$fresh = ['REMOTE_ADDR' => '192.168.1.5', 'HTTP_CF_CONNECTING_IP' => '198.18.1.1'];
+new_session($state);
+$r = req($state, ['server' => $fresh]);
+check(str_contains($r['html'], $locked_text) && !str_contains($r['html'], 'webauthn-go'),
+    'after ' . MAX_ACCOUNT_FAILURES . ' failures from as many addresses, a new address is throttled too');
+$r = req($state, ['server' => $fresh, 'sign' => $sign]);
+check(($r['webauthn'] ?? null) === null, '...and even the right passkey waits for the throttle');
+$data = json_decode(file_get_contents($failure_file), true);
+foreach ($data as $k => $e) {
+	$data[$k]['t'] = $e['t'] - ACCOUNT_THROTTLE - 1;
+}
+file_put_contents($failure_file, json_encode($data));
+new_session($state);
+$r = req($state, ['server' => $fresh]);
+check(str_contains($r['html'], 'webauthn-go'), 'after the throttle interval the account takes an attempt again');
+$r = req($state, ['server' => $fresh, 'sign' => $sign]);
+check(($r['webauthn']['method'] ?? null) === 'webauthn', '...and the right passkey works');
+
+/* ---- IPv6 addresses count per /64 ---- */
+@unlink($failure_file);
+setup($state, $settings);
+for ($i = 1; $i <= MAX_USER_FAILURES; $i++) {
+	$from = ['REMOTE_ADDR' => '192.168.1.5', 'HTTP_CF_CONNECTING_IP' => sprintf('2001:db8:1:2::%x', $i)];
+	new_session($state);
+	req($state, ['server' => $from]);
+	req($state, ['server' => $from, 'sign' => $sign + ['tamper' => true]]);
+}
+new_session($state);
+$r = req($state, ['server' => ['REMOTE_ADDR' => '192.168.1.5', 'HTTP_CF_CONNECTING_IP' => '2001:db8:1:2:ffff::1']]);
+check(str_contains($r['html'], $locked_text), 'another address in the same IPv6 /64 is locked too');
+new_session($state);
+$r = req($state, ['server' => ['REMOTE_ADDR' => '192.168.1.5', 'HTTP_CF_CONNECTING_IP' => '2001:db8:1:3::1']]);
+check(str_contains($r['html'], 'webauthn-go'), 'an address in another /64 is not');
+
 unlink($state);
 echo "$count checks, $failures failed\n";
 exit($failures ? 1 : 0);

@@ -94,7 +94,7 @@ Expected: after the fifth failure you are signed out. The log shows `passkey ver
 
 Sign in again and fail five more times (10 in all from this address).
 
-Expected: the next sign-in from `192.168.1.100` shows "Too many failed passkey attempts for this account from your address. Try again in 15 minutes, or sign in from a trusted network." Clear it on the console with `rm /conf/webauthn_failures.json` and check that the passkey works again.
+Expected: the next sign-in from `192.168.1.100` shows "Too many failed passkey attempts for this account. Try again in 15 minutes, or sign in from a trusted network." Clear it on the console with `rm /conf/webauthn_failures.json` and check that the passkey works again.
 
 ## 9. XMLRPC is refused
 

@@ -7,6 +7,8 @@
 #                       a required file is below the minimum (see
 #                       tools/coverage_report.php)
 #   REQUIRE_SHELLCHECK=1  fail if shellcheck is not installed (CI sets it)
+#   WEBAUTHN_SYSTEM_TEST=1  run the tests that change the system, and fail
+#                       if one of them cannot run (CI sets it)
 set -u
 cd "$(dirname "$0")/.." || exit 1
 php=${PHP:-php}
@@ -64,12 +66,14 @@ for t in tests/full_disk_hook_test.sh tests/install_uninstall_test.sh; do
 	echo "== $t"
 	if [ "$(id -u)" -ne 0 ]; then
 		echo "skipped (needs root)"
+		[ "${WEBAUTHN_SYSTEM_TEST:-}" = 1 ] && { echo "FAILED: WEBAUTHN_SYSTEM_TEST=1 but not root"; failed=1; }
 		continue
 	fi
 	sh "$t"
 	rc=$?
 	if [ "$rc" -eq 2 ]; then
 		echo "skipped (not possible on this machine)"
+		[ "${WEBAUTHN_SYSTEM_TEST:-}" = 1 ] && { echo "FAILED: $t was asked for (WEBAUTHN_SYSTEM_TEST=1) but skipped"; failed=1; }
 	elif [ "$rc" -ne 0 ]; then
 		echo "FAILED: $t"
 		failed=1

@@ -104,19 +104,21 @@ function webauthn_gate_refuse_unusable(string $user, string $decision, array $se
 		webauthn_log(LOG_WARNING, "user '{$user}' has no passkey, but another spelling of the username does; access refused", $source);
 		webauthn_gate_refuse('case', $settings);
 	}
-	if (webauthn_failure_lock_remaining($user, $source['client']) > 0) {
-		webauthn_log(LOG_WARNING, "user '{$user}' is locked out of the passkey step from this address after too many failed attempts", $source);
-		webauthn_gate_refuse('locked', $settings);
+	$wait = webauthn_failure_lock_remaining($user, $source['client']);
+	if ($wait > 0) {
+		webauthn_log(LOG_WARNING, "user '{$user}' may not try a passkey for {$wait} more seconds after too many failed attempts", $source);
+		webauthn_gate_refuse('locked', $settings, $wait);
 	}
 }
 
 /**
- * End the request with a page that offers only "Sign out" ($mode: deny, case or locked). Session must be open.
+ * End the request with a page that offers only "Sign out" ($mode: deny,
+ * case, or locked for $wait seconds). Session must be open.
  * @param WebAuthnSettings $settings
  */
-function webauthn_gate_refuse(string $mode, array $settings): never {
+function webauthn_gate_refuse(string $mode, array $settings, int $wait = 0): never {
 	phpsession_end(true);
-	webauthn_render_gate_page($mode, $settings, null, '');
+	webauthn_render_gate_page($mode, $settings, $mode == 'locked' ? ['wait' => $wait] : null, '');
 	exit;
 }
 
@@ -152,7 +154,7 @@ function webauthn_gate_skip(string $user, array $source, array $settings, bool $
 function webauthn_gate_assert(string $user, array $settings, array $source): string {
 	if (!webauthn_failure_begin($user, $source['client'])) {
 		webauthn_log(LOG_WARNING, "passkey attempt for user '{$user}' refused: too many failed attempts, or the attempt could not be recorded", $source);
-		webauthn_gate_refuse('locked', $settings);
+		webauthn_gate_refuse('locked', $settings, max(1, webauthn_failure_lock_remaining($user, $source['client'])));
 	}
 	$result = webauthn_gate_check_assertion($user, $settings);
 	if (is_array($result)) {
@@ -217,9 +219,10 @@ function webauthn_gate_check_assertion(string $user, array $settings) {
 		$client_data = webauthn_b64url_decode((string)($_POST['client_data'] ?? ''));
 		$authenticator_data = webauthn_b64url_decode((string)($_POST['authenticator_data'] ?? ''));
 		$signature = webauthn_b64url_decode((string)($_POST['signature'] ?? ''));
+		$user_handle = webauthn_b64url_decode((string)($_POST['user_handle'] ?? ''));
 		$id = (string)($_POST['credential_id'] ?? '');
 		$cred = webauthn_use_challenge('login', $user, $client_data,
-		    function ($challenge) use ($user, $settings, $client_data, $authenticator_data, $signature, $id) {
+		    function ($challenge) use ($user, $settings, $client_data, $authenticator_data, $signature, $user_handle, $id) {
 			$cred = webauthn_find_credential($user, $id);
 			if ($cred === null) {
 				throw new WebAuthnException('unknown credential');
@@ -228,7 +231,8 @@ function webauthn_gate_check_assertion(string $user, array $settings) {
 				throw new WebAuthnException('credential was registered for RP ID ' . ($cred['rp_id'] ?? '?'));
 			}
 			$count = webauthn_verify_assertion($cred, $client_data, $authenticator_data, $signature, $challenge,
-			    webauthn_rp_id($settings), webauthn_allowed_origins($settings), webauthn_require_uv($settings), $info);
+			    webauthn_rp_id($settings), webauthn_allowed_origins($settings), webauthn_require_uv($settings), $info,
+			    $user_handle, webauthn_user_handle($user));
 			if (!webauthn_advance_sign_count($cred['id'], $count)) {
 				throw new WebAuthnException('Signature counter did not increase or could not be stored; the authenticator may be cloned');
 			}
@@ -319,6 +323,7 @@ function webauthn_render_gate_page(string $mode, array $settings, ?array $option
 							<input type="hidden" name="client_data" id="client_data" />
 							<input type="hidden" name="authenticator_data" id="authenticator_data" />
 							<input type="hidden" name="signature" id="signature" />
+							<input type="hidden" name="user_handle" id="user_handle" />
 							<div id="webauthn-ready">
 								<p style="color:#fff"><?=gettext('Confirm your sign-in with a registered passkey or security key.')?></p>
 								<button type="button" id="webauthn-go" class="btn btn-success btn-sm"
@@ -334,8 +339,9 @@ function webauthn_render_gate_page(string $mode, array $settings, ?array $option
 							</div>
 <?php elseif ($mode == 'locked'): ?>
 							<input type="hidden" name="webauthn_action" value="cancel" />
-							<p style="color:#fff"><?=sprintf(gettext('Too many failed passkey attempts for this account from your address. Try again in %d minutes, or sign in from a trusted network.'),
-								intdiv(WEBAUTHN_FAILURE_WINDOW + 59, 60))?></p>
+<?php $wait = (int)($options['wait'] ?? WEBAUTHN_FAILURE_WINDOW); ?>
+							<p style="color:#fff"><?=sprintf(gettext('Too many failed passkey attempts for this account. Try again in %s, or sign in from a trusted network.'),
+								$wait < 60 ? sprintf(gettext('%d seconds'), $wait) : sprintf(gettext('%d minutes'), intdiv($wait + 59, 60)))?></p>
 <?php elseif ($mode == 'case'): ?>
 							<input type="hidden" name="webauthn_action" value="cancel" />
 							<p style="color:#fff"><?=gettext('The passkeys for this account are registered under another spelling of the username (for example different capitals or without a @domain suffix). Sign out, then sign in with the username exactly as it was registered.')?></p>

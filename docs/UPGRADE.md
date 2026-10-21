@@ -26,6 +26,11 @@ The CI checks the hooks against the files of pfSense CE 2.8.1 on every push, and
 
 ## Notes per version
 
+### 1.3.0
+
+- **Account-wide throttle.** After 30 failed passkey attempts for one account from any addresses in 15 minutes, the account takes at most one attempt every 20 seconds. IPv6 addresses are counted per /64. Clear the counts with `rm /conf/webauthn_failures.json`.
+- **User handle and topOrigin.** If an authenticator sends a user handle with its answer, it must be the account's (passkeys registered by any version of this package qualify). Cross-origin (iframe) ceremonies, marked by `topOrigin`, are refused. The page now sends the user handle, so reload it after the update.
+
 ### 1.2.0
 
 - **Failed-attempt limit across sessions.** 10 failed passkey attempts for one account from one client address, in any number of sessions, lock that address out of the account's passkey step for 15 minutes (`/conf/webauthn_failures.json`). The 5-per-session limit stays. If that file is damaged, no passkey sign-in works until it is fixed: `rm /conf/webauthn_failures.json`.

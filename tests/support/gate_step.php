@@ -75,6 +75,11 @@ if (!empty($req['sign'])) {
 	$_POST = ['webauthn_action' => 'assert', 'credential_id' => webauthn_b64url_encode($a->id),
 	    'client_data' => webauthn_b64url_encode($cd), 'authenticator_data' => webauthn_b64url_encode($ad),
 	    'signature' => webauthn_b64url_encode($sig)];
+	if (isset($req['sign']['user_handle'])) {
+		/* 'own', or a base64url user handle. */
+		$_POST['user_handle'] = $req['sign']['user_handle'] === 'own'
+		    ? webauthn_b64url_encode(hash('sha256', 'pfsense-webauthn:' . ($_SESSION['Username'] ?? ''), true)) : $req['sign']['user_handle'];
+	}
 }
 
 ob_start();

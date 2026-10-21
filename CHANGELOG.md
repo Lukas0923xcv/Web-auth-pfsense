@@ -2,6 +2,19 @@
 
 All notable changes. Versions follow [semantic versioning](https://semver.org/); what users must do after an update is in [docs/UPGRADE.md](docs/UPGRADE.md).
 
+## [1.3.0] - 2026-10-21
+
+### Security
+
+- Account-wide throttle on failed passkey attempts: after 30 from any addresses in 15 minutes, one attempt per 20 seconds. IPv6 addresses count per /64 for the per-address lock (round-1 review L1).
+- `response.userHandle`, when sent, must be the account's user handle (WebAuthn §7.2 step 6), and a `topOrigin` in the client data is refused as cross-origin (L2).
+- SECURITY.md lists the accepted risks of the attempt limits and of enrolling the first passkey with a password alone (I2).
+
+### Development
+
+- End-to-end tests of `webauthn_xmlrpc_guard()` (I1), of signing in with another user's passkey or user handle, of the throttle and of IPv6 /64 grouping.
+- CI runs the install/uninstall test on the files pfSense CE 2.8.1 ships, and a requested system test that cannot run now fails.
+
 ## [1.2.0] - 2026-10-21
 
 ### Security

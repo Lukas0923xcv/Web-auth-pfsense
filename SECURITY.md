@@ -11,6 +11,7 @@ If you review it, start with [docs/REVIEW-GUIDE.md](docs/REVIEW-GUIDE.md), and p
 | Date | Reviewer | Scope | Result |
 |---|---|---|---|
 | 2026-10-21 | AI adversarial review (separate agent, no access to the authoring context) | gate, webauthn, challenge, storage, xmlrpc_guard | 2 medium, 2 low, 2 info; all fixed, see below |
+| 2026-10-21 | AI scoring review, round 1 (separate agent) | whole repository against the improvement rubric | 2 low, 2 info; fixed in 1.3.0, see the second table below |
 | — | *human review wanted* | | |
 
 ## Reporting a vulnerability
@@ -26,7 +27,8 @@ Until a fix is out, you can switch the second factor off under **System > WebAut
 - **Cloned authenticators**, as far as their signature counter reveals them.
 - **Tunnel traffic posing as local traffic**: requests from the cloudflared address, carrying proxy headers, or coming from the firewall's own addresses never get the trusted-network exemption.
 - **Password-only XMLRPC** (HA sync, which can run commands as root): refused through a proxy, and while the second factor is on, from everyone except configured peers and trusted networks.
-- **Unlimited passkey attempts**: 5 failures end a session; 10 from one address for one account, over any number of sessions, lock that address out of the account's passkey step for 15 minutes.
+- **Many passkey attempts** (guessing a passkey is not possible, so this is defence in depth): 5 failures end a session; 10 from one address (IPv6: one /64) for one account, over any number of sessions, lock that address out of the account's passkey step for 15 minutes; after 30 failures for an account from any addresses, it takes at most one attempt every 20 seconds.
+- **Answers made for another account**: a passkey of another account is refused, and so is a user handle that is not this account's (WebAuthn §7.2 steps 5 and 6).
 
 ## What it does not protect against
 
@@ -47,7 +49,11 @@ The window in which the GUI accepts a password without a passkey therefore opens
 
 ## Accepted risks
 
+Every risk below needs the account's password. Changing the password ends it.
+
 - **Someone with the password, at the same client address as the real user** (for example behind the same NAT), can lock that address out of the account's passkey step for 15 minutes by failing on purpose. Without a lock, there would be no limit on attempts. The user can still sign in from another address or a trusted network.
+- **Someone with the password and many addresses** is not locked out, only throttled: after 30 failures they get one attempt every 20 seconds, at most 4,320 a day, each against a passkey signature that cannot be guessed. A hard account-wide lock would instead let them lock out the real user from anywhere. While they keep this up, the real user may also have to wait up to 20 seconds per attempt.
+- **The first passkey of an account can be registered with the password alone** when Enforce is off (or from a trusted network): the password already gives full access there, so asking for a passkey to add the first one would protect nothing. Once an account has a passkey, adding another needs a session verified with one. Turn Enforce on once every account has its passkey.
 - **A damaged file in /conf** (attempt counts, counters, revocation list) stops passkey sign-ins until it is removed: the package fails closed rather than guess. The log names the file; [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) says what to do.
 
 ## Findings of the 2026-10-21 review, and what was done
@@ -60,3 +66,12 @@ The window in which the GUI accepts a password without a passkey therefore opens
 | F4 | Low | A forged login POST with an empty username stripped a session's passkey verification. | Fixed in 1.2.0: a sign-in needs a non-empty username, as in pfSense's `session_auth()`. Test: `tests/xmlrpc_enrolment_replay_test.php` (F4). |
 | F5 | Info | Log lines could carry unfiltered client text (bidi overrides, line separators, unlimited length). | Fixed in 1.2.0: log text goes through `webauthn_plain()`. Test: (F5). |
 | F6 | Info | The cloudflared source had no size limit, so `0.0.0.0/0` would make forged client addresses appear in logs. | Fixed in 1.2.0: same /8 and /16 limit as trusted networks. Test: (F6). |
+
+## Findings of the round-1 scoring review, and what was done
+
+| ID | Severity | Finding | Resolution |
+|---|---|---|---|
+| L1 | Low | With the attempt limit per account and address, changing addresses gave unlimited attempts. | Fixed in 1.3.0: account-wide throttle (one attempt per 20 s after 30 failures), and IPv6 counted per /64. Test: `tests/failure_limit_test.php` ("a new address is throttled too", "same IPv6 /64"). |
+| L2 | Low | `response.userHandle` (§7.2 step 6) and `topOrigin` were not checked. | Fixed in 1.3.0: a user handle that is not the account's is refused, and any `topOrigin` is refused as cross-origin. Tests: `tests/webauthn_vectors_test.php` (step 6, topOrigin), `tests/gate_flow_test.php`. |
+| I1 | Info | `webauthn_xmlrpc_guard()` itself (403, exit) had no test. | Tested end to end in 1.3.0: `tests/xmlrpc_enrolment_replay_test.php` ("guard: ..."). |
+| I2 | Info | The first passkey can be enrolled with a password alone while Enforce is off. | By design; now listed under Accepted risks. |

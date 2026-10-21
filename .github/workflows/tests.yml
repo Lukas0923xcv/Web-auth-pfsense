@@ -71,7 +71,11 @@ jobs:
           php-version: '8.3'
           coverage: none
       - name: Check the hooks against the files of the 2.8.1 release (fails on a break)
-        run: sh tools/upstream_anchors.sh release
+        run: KEEP_DIR=/tmp/pfsense-2.8.1 sh tools/upstream_anchors.sh release
+      - name: Install, then uninstall, on the 2.8.1 files (byte-identical afterwards)
+        run: |
+          sudo env PATH="$PATH" PHP="$(command -v php)" WEBAUTHN_SYSTEM_TEST=1 WEBAUTHN_FIXTURES=/tmp/pfsense-2.8.1 \
+            sh tests/install_uninstall_test.sh
 
   pfsense-master:
     name: Hooks apply to pfSense master

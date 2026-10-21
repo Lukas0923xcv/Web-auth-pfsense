@@ -10,6 +10,7 @@
 # pfsense/pfsense on GitHub has no tag or branch for 2.8.x (its tags stop
 # at v2.5.2, its RELENG branches at 2_7_2), so the released files come from
 # the release's own package. Exits 1 if a hook does not apply.
+# With KEEP_DIR set, the three files are also copied there.
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 php=${PHP:-php}
@@ -77,4 +78,8 @@ release)
 	;;
 esac
 
+if [ -n "${KEEP_DIR:-}" ]; then
+	mkdir -p "$KEEP_DIR"
+	cp "$dir/authgui.inc" "$dir/auth_check.inc" "$dir/xmlrpc.php" "$KEEP_DIR/"
+fi
 "$php" tools/check_anchors.php "$dir"

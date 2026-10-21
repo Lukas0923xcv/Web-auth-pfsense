@@ -60,6 +60,11 @@ define('WEBAUTHN_MAX_FAILURES', 5);
  * WEBAUTHN_FAILURE_WINDOW seconds. */
 define('WEBAUTHN_MAX_USER_FAILURES', 10);
 define('WEBAUTHN_FAILURE_WINDOW', 900);
+/* Over all addresses: after this many failed attempts for one account in
+ * WEBAUTHN_FAILURE_WINDOW, the account takes at most one passkey attempt
+ * per WEBAUTHN_ACCOUNT_THROTTLE seconds, wherever it comes from. */
+define('WEBAUTHN_MAX_ACCOUNT_FAILURES', 30);
+define('WEBAUTHN_ACCOUNT_THROTTLE', 20);
 define('WEBAUTHN_CHALLENGE_TTL', 300);
 /* A passkey verification is good for this long at most (seconds). */
 define('WEBAUTHN_VERIFIED_MAX_AGE', 12 * 3600);
@@ -347,6 +352,11 @@ function webauthn_ip_in_list(string $ip, array $list): bool {
 		}
 	}
 	return false;
+}
+
+/* The WebAuthn user handle (user.id) of account $username: registration sends it, sign-in checks it. */
+function webauthn_user_handle(string $username): string {
+	return hash('sha256', 'pfsense-webauthn:' . webauthn_normalize_username($username), true);
 }
 
 /* Is the prefix shorter than /8 (IPv4) or /16 (IPv6)? */

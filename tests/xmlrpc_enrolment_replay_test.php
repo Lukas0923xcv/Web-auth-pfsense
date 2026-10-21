@@ -205,6 +205,18 @@ $line = webauthn_log_line("Origin https://a\u{202E}moc.evil\u{2028} from 10.0.0.
 check(!preg_match('/[\x{202E}\x{2028}\n]/u', $line) && strlen($line) < 1200 && str_ends_with($line, ' from 203.0.113.9 (via cloudflared 192.168.1.5)'),
     'F5 log line: no bidi or line separators, bounded, real source last');
 
+/* The guard itself, as the xmlrpc.php hook runs it: refused requests get a 403 and never reach XMLRPC. */
+function xmlrpc_req(array $settings, array $server): string {
+	return (string)shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(__DIR__ . '/support/xmlrpc_step.php') . ' ' .
+	    escapeshellarg(json_encode($settings)) . ' ' . escapeshellarg(json_encode($server)));
+}
+$out = xmlrpc_req($settings, ['REMOTE_ADDR' => '10.0.0.66']);
+check(str_contains($out, 'XMLRPC is not available from this address.') && !str_contains($out, 'PASSED'), 'guard: a LAN host outside peers/trusted networks is stopped');
+$out = xmlrpc_req($settings, ['REMOTE_ADDR' => '192.168.1.5', 'HTTP_CF_CONNECTING_IP' => '203.0.113.9']);
+check(str_contains($out, 'XMLRPC is not available') && !str_contains($out, 'PASSED'), 'guard: a request through cloudflared is stopped');
+check(str_contains(xmlrpc_req($settings, ['REMOTE_ADDR' => '192.168.1.20']), 'PASSED'), 'guard: a trusted-network host passes');
+check(str_contains(xmlrpc_req(array_merge($settings, ['xmlrpc_peers' => '10.0.0.66']), ['REMOTE_ADDR' => '10.0.0.66']), 'PASSED'), 'guard: a listed peer passes');
+
 /* F6: the cloudflared source has the same size limit as trusted networks. */
 check(!empty(webauthn_validate_settings(array_merge($settings, ['trusted_proxies' => '0.0.0.0/1']))), 'F6 a huge cloudflared source is refused');
 check(empty(webauthn_validate_settings(array_merge($settings, ['trusted_proxies' => '172.16.0.0/12']))), 'F6 a normal one is accepted');

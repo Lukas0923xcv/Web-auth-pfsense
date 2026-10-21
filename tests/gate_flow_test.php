@@ -133,6 +133,33 @@ $s3['enable'] = '';
 setup($state, $s3);
 check(req($state, ['server' => $tunnel])['returned'], 'disabled gate passes');
 
+/* §7.2 step 5: a passkey of another account is refused, even with a valid signature. */
+setup($state, $settings);
+$st = unserialize(file_get_contents($state));
+$other = new FakeAuthenticator(WEBAUTHN_ALG_ES256);
+$och = random_bytes(32);
+[$ocd, $oatt] = $other->create($och, 'example.com', 'https://pfsense.example.com');
+$oreg = webauthn_verify_registration($ocd, $oatt, $och, 'example.com', ['https://pfsense.example.com'], false);
+$st['config']['installedpackages']['webauthn']['item'][] = [
+	'username' => 'bob', 'name' => 'bobkey', 'id' => webauthn_b64url_encode($oreg['credential_id']),
+	'alg' => (string)$oreg['alg'], 'publickey' => base64_encode($oreg['pem']), 'rp_id' => 'example.com', 'created' => '0',
+];
+$st['session']['Username'] = 'bob';                 /* bob signs in, then answers with admin's passkey */
+file_put_contents($state, serialize($st));
+$r = req($state, ['server' => $tunnel]);
+check(str_contains($r['html'], 'webauthn-go'), 'bob gets the challenge');
+$r = req($state, ['server' => $tunnel, 'sign' => $sign]);
+check(($r['webauthn'] ?? null) === null && $r['failures'] == 1, "another user's passkey is refused");
+
+/* §7.2 step 6: a userHandle sent with the answer must be this account's. */
+setup($state, $settings);
+req($state, ['server' => $tunnel]);
+$r = req($state, ['server' => $tunnel, 'sign' => $sign + ['user_handle' => webauthn_b64url_encode(hash('sha256', 'pfsense-webauthn:bob', true))]]);
+check(($r['webauthn'] ?? null) === null && $r['failures'] == 1, "a userHandle of another account is refused");
+req($state, ['server' => $tunnel]);
+$r = req($state, ['server' => $tunnel, 'sign' => $sign + ['user_handle' => 'own']]);
+check(($r['webauthn']['method'] ?? null) === 'webauthn', "the account's own userHandle is accepted");
+
 unlink($state);
 echo "$count checks, $failures failed\n";
 exit($failures ? 1 : 0);

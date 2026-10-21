@@ -63,6 +63,6 @@ ingress:
 
 - **Not covered:** SSH and the console, other services (VPN and so on), packages with their own login. XMLRPC (`/xmlrpc.php`) uses only a password; while the second factor is on, it is refused except from XMLRPC peers and trusted networks.
 - **A passkey belongs to the exact username.** Removing a passkey signs out the sessions it verified. A verification lasts at most 12 hours.
-- **Failed attempts:** 5 failed passkey attempts end the session. 10 failed attempts for one account from one address, over any number of sessions, lock that address out of the account's passkey step for 15 minutes. Other addresses and trusted networks are not affected.
+- **Failed attempts:** 5 failed passkey attempts end the session. 10 failed attempts for one account from one address (IPv6: one /64), over any number of sessions, lock that address out of the account's passkey step for 15 minutes; other addresses and trusted networks are not affected. After 30 failures for an account from any addresses, it takes at most one attempt every 20 seconds.
 - Passkeys and settings live in `config.xml`, so they are in backups. Counters, attempt counts and the list of removed passkeys are in `/conf/webauthn_*`, not in backups.
 - If the package files are removed without the uninstaller, the GUI stops working (fail closed) instead of skipping the passkey step.

@@ -98,6 +98,9 @@ function webauthnLoginInit() {
 			document.getElementById('client_data').value = webauthnBufToB64url(cred.response.clientDataJSON);
 			document.getElementById('authenticator_data').value = webauthnBufToB64url(cred.response.authenticatorData);
 			document.getElementById('signature').value = webauthnBufToB64url(cred.response.signature);
+			if (cred.response.userHandle) {
+				document.getElementById('user_handle').value = webauthnBufToB64url(cred.response.userHandle);
+			}
 			document.getElementById('webauthn-form').submit();
 		}).catch(function (e) {
 			btn.disabled = false;

@@ -13,7 +13,7 @@ Messages from the package appear in **Status > System Logs > System > General** 
    ```
    This removes the hooks; passkeys and settings stay. Sign in with the password, fix the passkeys, then run the install command from the README again.
 
-**"Too many failed passkey attempts for this account from your address."** 10 failed attempts from your address locked the passkey step there for 15 minutes. Wait, or sign in from a trusted network or another address. If this was not you, someone has your password: change it. To clear the lock at once, from a shell:
+**"Too many failed passkey attempts for this account. Try again in ..."** Either 10 failed attempts came from your address (the passkey step is locked there for 15 minutes), or 30 came for the account from anywhere (it then takes one attempt every 20 seconds). Wait the time shown, or sign in from a trusted network. If this was not you, someone has your password: change it in **System > User Manager**. To clear the counts at once, from a shell:
 ```sh
 rm /conf/webauthn_failures.json
 ```
@@ -45,7 +45,7 @@ Run:
 The install command stops with `sha256: ... [ Failed ]` (or `SHA256 ... != ...`) and installs nothing. The download is not exactly the pinned version.
 
 1. Run the command again: a broken download fails the same way.
-2. If it fails again, do not install. Compare the hash with the `SHA256SUMS` file of the matching release on the repository's **Releases** page, and open an issue with the output of:
+2. If it fails again, do not install. Compare the hash with the one in the README of the repository and, once releases are published, with the `SHA256SUMS` file of the matching release on the **Releases** page. Open an issue with the output of:
    ```sh
    sha256 /root/webauthn.tar.gz
    ```

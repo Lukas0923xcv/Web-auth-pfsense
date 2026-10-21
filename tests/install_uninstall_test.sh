@@ -5,8 +5,16 @@
 # It writes to /etc/inc, /usr/local and /var/run like on pfSense, so it
 # runs only as root, only with WEBAUTHN_SYSTEM_TEST=1 (CI sets it), and
 # only where none of the pfSense paths exist yet. Exit 2 means skipped.
+#
+# WEBAUTHN_FIXTURES: a directory with other copies of the three files (CI
+# uses the ones pfSense CE 2.8.1 ships); default tests/fixtures.
 set -u
 repo=$(cd "$(dirname "$0")/.." && pwd)
+fixtures=${WEBAUTHN_FIXTURES:-$repo/tests/fixtures}
+for f in authgui.inc auth_check.inc xmlrpc.php; do
+	[ -f "$fixtures/$f" ] || { echo "$fixtures/$f missing"; exit 1; }
+done
+echo "pfSense files from $fixtures"
 
 if [ "${WEBAUTHN_SYSTEM_TEST:-}" != 1 ] || [ "$(id -u)" -ne 0 ]; then
 	echo "skipped (set WEBAUTHN_SYSTEM_TEST=1 and run as root, on a throw-away machine)"
@@ -30,10 +38,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# pfSense's files, from tests/fixtures.
+# pfSense's files, from $fixtures.
 mkdir -p /etc/inc /usr/local/www /usr/local/bin /usr/local/etc/rc.d
-cp "$repo/tests/fixtures/authgui.inc" "$repo/tests/fixtures/auth_check.inc" /etc/inc/
-cp "$repo/tests/fixtures/xmlrpc.php" /usr/local/www/
+cp "$fixtures/authgui.inc" "$fixtures/auth_check.inc" /etc/inc/
+cp "$fixtures/xmlrpc.php" /usr/local/www/
 if ! getent group wheel >/dev/null; then
 	groupadd wheel && created_wheel=1
 fi
@@ -116,7 +124,7 @@ echo "$out" | grep -q "^Installed version $(cat "$repo/src/usr/local/pkg/webauth
 check $? 'install.sh reports the installed version'
 /usr/local/bin/php -f /usr/local/pkg/webauthn/hook.php status >/dev/null
 check $? 'hook.php status: every hook, the cron job and the boot command present'
-! cmp -s /etc/inc/authgui.inc "$repo/tests/fixtures/authgui.inc"
+! cmp -s /etc/inc/authgui.inc "$fixtures/authgui.inc"
 check $? 'authgui.inc is patched'
 grep -q "webauthn_gate();" /etc/inc/authgui.inc && grep -q "webauthn_cached_privileges_allowed" /etc/inc/auth_check.inc && grep -q "webauthn_xmlrpc_guard();" /usr/local/www/xmlrpc.php
 check $? 'all three hooks are in place'
@@ -135,11 +143,11 @@ rc=$?
 echo "$out" | sed 's/^/    uninstall: /'
 [ "$rc" -eq 0 ]
 check $? 'uninstall.sh succeeds'
-cmp -s /etc/inc/authgui.inc "$repo/tests/fixtures/authgui.inc"
+cmp -s /etc/inc/authgui.inc "$fixtures/authgui.inc"
 check $? 'authgui.inc byte-identical to the original after uninstall'
-cmp -s /etc/inc/auth_check.inc "$repo/tests/fixtures/auth_check.inc"
+cmp -s /etc/inc/auth_check.inc "$fixtures/auth_check.inc"
 check $? 'auth_check.inc byte-identical to the original after uninstall'
-cmp -s /usr/local/www/xmlrpc.php "$repo/tests/fixtures/xmlrpc.php"
+cmp -s /usr/local/www/xmlrpc.php "$fixtures/xmlrpc.php"
 check $? 'xmlrpc.php byte-identical to the original after uninstall'
 [ ! -e /usr/local/pkg/webauthn ] && [ ! -e /usr/local/www/system_webauthn.php ] && [ ! -e /usr/local/www/webauthn ] && [ ! -e /usr/local/etc/rc.d/webauthn_hook.sh ]
 check $? 'package files removed'

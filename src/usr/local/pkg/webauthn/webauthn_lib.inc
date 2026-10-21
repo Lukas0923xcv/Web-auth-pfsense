@@ -2,8 +2,8 @@
 /*
  * webauthn_lib.inc
  *
- * Self-contained WebAuthn Level 2 relying-party verification
- * (registration and assertion). It has no pfSense dependencies so it
+ * Self-contained WebAuthn Level 3 relying-party verification
+ * (registration §7.1 and assertion §7.2). It has no pfSense dependencies so it
  * can be unit tested off-box.
  *
  * Supported algorithms: ES256 (-7), RS256 (-257), and EdDSA/Ed25519 (-8)
@@ -285,7 +285,8 @@ function webauthn_check_client_data(string $client_data_json, string $type, stri
 	if ($origin === '' || !in_array($origin, $allowed, true)) {
 		throw new WebAuthnException('Origin ' . ($cd['origin'] ?? '(none)') . ' is not allowed');
 	}
-	if (!empty($cd['crossOrigin'])) {
+	/* Level 3: topOrigin is only present for a cross-origin (iframe) ceremony. */
+	if (!empty($cd['crossOrigin']) || array_key_exists('topOrigin', $cd)) {
 		throw new WebAuthnException('Cross-origin ceremonies are not allowed');
 	}
 	return $cd;
@@ -346,13 +347,21 @@ function webauthn_verify_registration(string $client_data_json, string $attestat
  * stored credential (['alg' => int, 'pem' => string, 'sign_count' => int]).
  * Returns the new signature counter. $info, if passed, receives
  * ['flags' => int, 'uv' => bool] of the verified authenticator data.
+ * $user_handle is response.userHandle as sent (null or '' if the
+ * authenticator sent none); if present it must equal $expected_user_handle,
+ * the user.id the credential was registered with (§7.2 step 6).
  * @param array<string, mixed> $credential
  * @param array<string> $allowed_origins
  * @param array{flags: int, uv: bool}|null $info
  * @param-out array{flags: int, uv: bool} $info
  */
 function webauthn_verify_assertion(array $credential, string $client_data_json, string $authenticator_data,
-    string $signature, string $challenge, string $rp_id, array $allowed_origins, bool $require_uv, ?array &$info = null): int {
+    string $signature, string $challenge, string $rp_id, array $allowed_origins, bool $require_uv, ?array &$info = null,
+    ?string $user_handle = null, ?string $expected_user_handle = null): int {
+	if ($user_handle !== null && $user_handle !== '' &&
+	    ($expected_user_handle === null || !hash_equals($expected_user_handle, $user_handle))) {
+		throw new WebAuthnException('User handle does not belong to this account');
+	}
 	webauthn_check_client_data($client_data_json, 'webauthn.get', $challenge, $allowed_origins);
 
 	$ad = webauthn_parse_auth_data($authenticator_data);
