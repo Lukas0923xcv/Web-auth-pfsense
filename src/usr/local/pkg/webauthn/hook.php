@@ -225,6 +225,11 @@ case 'uninstall':
 		echo "Could not remove every hook (see errors above); nothing else was changed.\n";
 		exit(1);
 	}
+	/* The originals are back in place: their backups are no longer needed. */
+	foreach (webauthn_hook_targets() as $t) {
+		@unlink(backup_path($t['file']));
+		@unlink($t['file'] . '.webauthn-orig');
+	}
 	set_cron(false);
 	set_earlyshellcmd(false);
 	set_menu(false);

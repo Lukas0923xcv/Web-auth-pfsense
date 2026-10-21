@@ -1,10 +1,12 @@
 <?php
 /*
- * Regression tests for the third security review (REVIEW3.md):
- *   php tests/review3/review3_test.php
+ * LDAP/RADIUS spellings, enrolment rules, XMLRPC refusal and challenge
+ * replay (R1-R10 of the third review, kept in the git history):
+ *   php tests/xmlrpc_enrolment_replay_test.php
  */
 $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-r3-count.json");
+define('WEBAUTHN_FAILURE_FILE', "$tmp/webauthn-r3-failures.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-r3.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-r3-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-r3-revoked.json");
@@ -38,7 +40,7 @@ function config_set_path($path, $value) {
 	$c = $value;
 }
 function write_config($desc) { return $GLOBALS['test_config']; }
-/* The in-memory config is the one on disk (see tests/review4 for the snapshot case). */
+/* The in-memory config is the one on disk (see tests/storage_and_sessions_test.php for the snapshot case). */
 function config_read_file(bool $use_backup = false, bool $use_cache = true): bool { return true; }
 function phpsession_begin() {}
 function phpsession_end($w = false) {}
@@ -46,11 +48,11 @@ if (!function_exists('gettext')) {
 	function gettext($s) { return $s; }
 }
 
-$repo = dirname(__DIR__, 2);
+$repo = dirname(__DIR__);
 $pkg = "$repo/src/usr/local/pkg/webauthn";
 require_once("$pkg/gate.inc");
 require_once("$pkg/xmlrpc_guard.inc");
-require_once("$repo/tests/helpers.inc");
+require_once("$repo/tests/support/helpers.inc");
 
 $failures = 0;
 $count = 0;
@@ -168,6 +170,44 @@ check(webauthn_xmlrpc_refused(webauthn_request_source(['REMOTE_ADDR' => '10.0.0.
 check(!empty(webauthn_validate_settings(array_merge($settings, ['xmlrpc_peers' => '0.0.0.0/0']))), 'R5 /0 XMLRPC peer refused');
 check(!empty(webauthn_validate_settings(array_merge($settings, ['xmlrpc_peers' => 'peer.example']))), 'R5 invalid XMLRPC peer refused');
 check(empty(webauthn_validate_settings(array_merge($settings, ['xmlrpc_peers' => '10.10.10.2']))), 'R5 XMLRPC peer accepted');
+
+/*
+ * Review findings F2, F4-F6 (fresh adversarial review, round 1).
+ * F2: cloudflared on the firewall forwards Cloudflare private-network
+ * (WARP) traffic to a LAN IP as plain TCP from the firewall's own address,
+ * without proxy headers. That must never count as the trusted network.
+ */
+$warp = webauthn_request_source(['REMOTE_ADDR' => '192.168.1.1', 'SERVER_ADDR' => '192.168.1.1'], $settings);
+check($warp['from_firewall'] && !webauthn_source_is_trusted_network($warp, $settings), 'F2 the firewall\'s own LAN address is not a trusted network');
+check(webauthn_gate_decision(array_merge($settings, ['enforce' => 'yes']), $warp, true) === 'require', 'F2 ...so the passkey step is required');
+check(webauthn_xmlrpc_refused($warp, $settings), 'F2 ...and XMLRPC from it is refused');
+check(!webauthn_xmlrpc_refused($warp, array_merge($settings, ['xmlrpc_peers' => '192.168.1.1'])), 'F2 unless that address is listed as an XMLRPC peer');
+$loop = webauthn_request_source(['REMOTE_ADDR' => '127.0.0.1'], array_merge($settings, ['trusted_proxies' => '10.9.9.9', 'trusted_networks' => '127.0.0.0/8']));
+check($loop['from_firewall'] && !webauthn_source_is_trusted_network($loop, array_merge($settings, ['trusted_networks' => '127.0.0.0/8'])),
+    'F2 loopback is never a trusted network');
+function get_configured_ip_addresses() { return ['lan' => '192.168.1.1', 'opt1' => '10.20.0.1']; }
+$opt = webauthn_request_source(['REMOTE_ADDR' => '10.20.0.1', 'SERVER_ADDR' => '192.168.1.1'], $settings);
+check($opt['from_firewall'], 'F2 another interface address of the firewall is recognised');
+check(!webauthn_request_source(['REMOTE_ADDR' => '192.168.1.20', 'SERVER_ADDR' => '192.168.1.1'], $settings)['from_firewall'] &&
+    webauthn_source_is_trusted_network($lan_trusted, $settings), 'F2 an ordinary LAN host keeps the exemption');
+
+/* F4: a POST with an empty username is no sign-in for pfSense and must not strip the verification. */
+$_POST = ['login' => '1', 'usernamefld' => ''];
+check(!webauthn_is_login_post(), 'F4 login POST with an empty username is not a sign-in');
+$_POST = ['login' => '1', 'usernamefld' => ['x']];
+check(!webauthn_is_login_post(), 'F4 ...nor one with an array as username');
+$_POST = ['login' => '1', 'usernamefld' => 'admin', 'passwordfld' => 'x'];
+check(webauthn_is_login_post(), 'F4 a real sign-in still is');
+$_POST = [];
+
+/* F5: client-supplied text in log lines is one plain line, and the real source stays last. */
+$line = webauthn_log_line("Origin https://a\u{202E}moc.evil\u{2028} from 10.0.0.1 (via cloudflared x)" . str_repeat('A', 2000), $tunnel);
+check(!preg_match('/[\x{202E}\x{2028}\n]/u', $line) && strlen($line) < 1200 && str_ends_with($line, ' from 203.0.113.9 (via cloudflared 192.168.1.5)'),
+    'F5 log line: no bidi or line separators, bounded, real source last');
+
+/* F6: the cloudflared source has the same size limit as trusted networks. */
+check(!empty(webauthn_validate_settings(array_merge($settings, ['trusted_proxies' => '0.0.0.0/1']))), 'F6 a huge cloudflared source is refused');
+check(empty(webauthn_validate_settings(array_merge($settings, ['trusted_proxies' => '172.16.0.0/12']))), 'F6 a normal one is accepted');
 
 /*
  * R7. The used-nonce list is the only replay barrier for authenticators

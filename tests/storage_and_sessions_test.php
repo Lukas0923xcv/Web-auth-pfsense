@@ -1,10 +1,13 @@
 <?php
 /*
- * Regression tests for the fourth review (REVIEW4.md):
- *   php tests/review4/review4_test.php
+ * Signature counters, verified-session binding, lost updates, LDAP
+ * spellings, local identities, notice text, passkey names, deleted
+ * accounts and hardening limits (fourth review, kept in the git history):
+ *   php tests/storage_and_sessions_test.php
  */
 $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-r4-count.json");
+define('WEBAUTHN_FAILURE_FILE', "$tmp/webauthn-r4-failures.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-r4.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-r4-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-r4-revoked.json");
@@ -64,10 +67,10 @@ if (!function_exists('gettext')) {
 	function gettext($s) { return $s; }
 }
 
-$repo = dirname(__DIR__, 2);
+$repo = dirname(__DIR__);
 $pkg = "$repo/src/usr/local/pkg/webauthn";
 require_once("$pkg/gate.inc");
-require_once("$repo/tests/helpers.inc");
+require_once("$repo/tests/support/helpers.inc");
 
 $failures = 0;
 $count = 0;
@@ -273,6 +276,11 @@ $ch = random_bytes(32);
 [$cd, $att] = $a2->create($ch, $rp, "https://$rp");
 check(webauthn_add_credential('admin', 'again', webauthn_verify_registration($cd, $att, $ch, $rp, ["https://$rp"], false), $rp) === null &&
     webauthn_find_credential('admin', $rid) !== null, '8: registering the same ID again makes it valid again');
+/* §7.1 step 27: a credential ID that is registered (and not revoked) cannot be registered again, for anyone. */
+[$cd, $att] = $a2->create($ch, $rp, "https://$rp");
+$dup = webauthn_verify_registration($cd, $att, $ch, $rp, ["https://$rp"], false);
+check(webauthn_add_credential('bob', 'copy', $dup, $rp) === gettext('This passkey is already registered.') &&
+    count(webauthn_get_credentials('bob')) === 0, '8: an ID that is already registered is refused (also for another user)');
 
 /* Re-registering a revoked ID whose old record a restore brought back: if the save fails, the old record stays revoked. */
 reset_config($settings, $users);

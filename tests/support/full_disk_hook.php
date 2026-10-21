@@ -3,8 +3,8 @@
  * R3: on a full disk, hook.php must leave authgui.inc unchanged. An
  * empty authgui.inc (php -l accepts one) would remove all GUI login.
  *
- * Usage (root, needs a tiny full filesystem; see hook_enospc.sh):
- *   php tests/review3/hook_enospc.php <dir-on-full-fs>
+ * Usage (root, needs a tiny full filesystem; see tests/full_disk_hook_test.sh):
+ *   php tests/support/full_disk_hook.php <dir-on-full-fs>
  * The real hook.inc and hook.php functions are loaded with the target
  * path and the php binary path substituted.
  */

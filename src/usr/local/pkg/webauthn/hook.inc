@@ -24,6 +24,9 @@ define('WEBAUTHN_HOOK_BEGIN', '/* BEGIN pfSense-webauthn hook */');
 define('WEBAUTHN_HOOK_END', '/* END pfSense-webauthn hook */');
 define('WEBAUTHN_AUTHGUI', '/etc/inc/authgui.inc');
 
+/**
+ * @return array<string, array{file: string, anchor: string, body: string}>
+ */
 function webauthn_hook_targets(): array {
 	return [
 		'authgui' => [

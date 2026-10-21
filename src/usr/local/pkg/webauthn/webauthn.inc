@@ -49,7 +49,17 @@ if (!defined('WEBAUTHN_STATE_FILE')) {
 	/* Hash of installedpackages/webauthn as last saved by this package. */
 	define('WEBAUTHN_STATE_FILE', '/conf/webauthn_state.json');
 }
+if (!defined('WEBAUTHN_FAILURE_FILE')) {
+	/* Failed passkey attempts per account (see webauthn_failure_begin()). */
+	define('WEBAUTHN_FAILURE_FILE', '/conf/webauthn_failures.json');
+}
+/* Failed passkey attempts in one session before it is ended. */
 define('WEBAUTHN_MAX_FAILURES', 5);
+/* Passkey attempts per account and client address, over all sessions,
+ * before that address is locked out of the account's passkey step for
+ * WEBAUTHN_FAILURE_WINDOW seconds. */
+define('WEBAUTHN_MAX_USER_FAILURES', 10);
+define('WEBAUTHN_FAILURE_WINDOW', 900);
 define('WEBAUTHN_CHALLENGE_TTL', 300);
 /* A passkey verification is good for this long at most (seconds). */
 define('WEBAUTHN_VERIFIED_MAX_AGE', 12 * 3600);
@@ -64,6 +74,9 @@ define('WEBAUTHN_NOTICE_INTERVAL', 900);
 require_once(__DIR__ . '/storage.inc');
 require_once(__DIR__ . '/challenge.inc');
 
+/**
+ * @return WebAuthnSettings
+ */
 function webauthn_default_settings(): array {
 	return [
 		'enable' => '',
@@ -90,6 +103,9 @@ function webauthn_version(): string {
 	return preg_match('/^[0-9A-Za-z.\-]{1,32}$/', $v) ? $v : 'unknown';
 }
 
+/**
+ * @return WebAuthnSettings
+ */
 function webauthn_settings(): array {
 	$s = config_get_path(WEBAUTHN_CONFIG_PATH, []);
 	return array_merge(webauthn_default_settings(), is_array($s) ? $s : []);
@@ -138,7 +154,7 @@ function webauthn_username_fold(?string $username): string {
 	return mb_convert_kana(mb_convert_case($u, MB_CASE_FOLD, 'UTF-8'), 'c', 'UTF-8');
 }
 
-/*
+/**
  * The account names an authentication backend may take $username to
  * mean, used only to stop other spellings of a remote (LDAP/RADIUS)
  * account from skipping the passkey step. pfSense's LDAP code keeps the
@@ -149,6 +165,7 @@ function webauthn_username_fold(?string $username): string {
  * $login: the name typed at sign-in. Only for it is the part before "\"
  * a candidate (pfSense's LDAP quirk); for a stored passkey owner it is
  * just a domain, and two users of one domain must not match each other.
+ * @return list<string>
  */
 function webauthn_username_keys(?string $username, bool $login): array {
 	$u = webauthn_username_fold($username);
@@ -169,23 +186,25 @@ function webauthn_username_keys(?string $username, bool $login): array {
 		/* "user@realm" and "user%realm" */
 		$keys[] = trim(preg_split('/[@%]/', $p, 2)[0]);
 	}
-	return array_values(array_unique(array_filter($keys, 'strlen')));
+	return array_values(array_unique(array_filter($keys, fn(string $k) => $k !== '')));
 }
 
-/*
+/**
  * Did this session sign in against pfSense's own user database? Local
  * names are exact and case-sensitive: "Bob" and "bob" are two accounts.
+ * @param WebAuthnSession $session
  */
 function webauthn_session_is_local(array $session): bool {
 	return in_array($session['authsource'] ?? null, ['Local Database', 'Local Database Fallback'], true);
 }
 
-/*
+/**
  * The local account named $name, or null. pfSense's getUserEntry() looks
  * names up through an array index; PHP turns only canonical decimal
  * strings into integer keys, so that lookup is an exact string match,
  * which this repeats without depending on auth.inc being loaded. With
  * duplicate names the last entry wins, as in pfSense's index.
+ * @return array<string, mixed>|null
  */
 function webauthn_local_user(string $name): ?array {
 	$found = null;
@@ -199,11 +218,12 @@ function webauthn_local_user(string $name): ?array {
 	return $found;
 }
 
-/*
+/**
  * The account a session belongs to, as passkey owner. For local accounts
  * it is the name the user database resolves the sign-in name to, and ''
  * when it resolves to none: such a session has to pass the passkey step
  * and cannot (fail closed). Remote accounts keep the sign-in name.
+ * @param WebAuthnSession $session
  */
 function webauthn_session_identity(array $session): string {
 	$typed = webauthn_normalize_username($session['Username'] ?? '');
@@ -223,54 +243,25 @@ function webauthn_session_sid(): string {
 	return (string)$sid;
 }
 
-/* Is this request a password sign-in (pfSense's login form)? */
-function webauthn_is_login_post(): bool {
-	return isset($_POST['login']) && isset($_POST['usernamefld']);
-}
-
 /*
- * For a session signed in through an LDAP server, the account name
- * pfSense's ldap_backed() actually authenticated: the part before "@"
- * (unless the server has ldap_nostrip_at) and then before "". Null for
- * other sessions.
+ * Is this request a password sign-in (pfSense's login form)? The same test
+ * as session_auth(): "login" set and a username given. A POST with an
+ * empty username is no sign-in for pfSense, so it must not end the
+ * passkey verification either (review finding F4: a cross-site POST could
+ * otherwise strip it).
  */
-function webauthn_ldap_account(array $session): ?string {
-	$nostrip = webauthn_ldap_nostrip($session);
-	if ($nostrip === null) {
-		return null;
-	}
-	$u = webauthn_normalize_username($session['Username'] ?? '');
-	if (!$nostrip && str_contains($u, '@')) {
-		$u = explode('@', $u, 2)[0];
-	}
-	if (str_contains($u, '\\')) {
-		$u = explode('\\', $u, 2)[0];
-	}
-	return $u;
+function webauthn_is_login_post(): bool {
+	return isset($_POST['login']) && is_string($_POST['usernamefld'] ?? null) && $_POST['usernamefld'] !== '';
 }
 
-/* For an LDAP session: does its server keep "@domain" (ldap_nostrip_at)? Null for other sessions. */
-function webauthn_ldap_nostrip(array $session): ?bool {
-	$source = (string)($session['authsource'] ?? '');
-	if (!str_starts_with($source, 'LDAP/')) {
-		return null;
-	}
-	$nostrip = false;
-	foreach ((array)config_get_path('system/authserver', []) as $a) {
-		if (is_array($a) && ($a['type'] ?? '') === 'ldap' && 'LDAP/' . ($a['name'] ?? '') === $source) {
-			$nostrip = isset($a['ldap_nostrip_at']);
-		}
-	}
-	return $nostrip;
-}
-
-/*
+/**
  * May passkeys be stored under this session's name? Not if it holds
  * control or format characters (they would end up in config.xml). For
  * LDAP and RADIUS, not if it contains "\" or "/": the part after them
  * would make the passkey count for another account, although the backend
  * may have authenticated the part before (pfSense signs "x\carol" in as
  * LDAP user x). Such users register under their plain name.
+ * @param WebAuthnSession $session
  */
 function webauthn_registrable_name(array $session): bool {
 	$u = webauthn_session_identity($session);
@@ -280,7 +271,10 @@ function webauthn_registrable_name(array $session): bool {
 	return webauthn_session_is_local($session) || (!str_contains($u, '\\') && !str_contains($u, '/'));
 }
 
-/* Passkeys registered under another spelling of the sign-in name $username (see webauthn_username_keys()). */
+/**
+ * Passkeys registered under another spelling of the sign-in name $username (see webauthn_username_keys()).
+ * @return list<WebAuthnCredential>
+ */
 function webauthn_case_variant_credentials(string $username): array {
 	$out = [];
 	$mine = webauthn_username_keys($username, true);
@@ -294,19 +288,24 @@ function webauthn_case_variant_credentials(string $username): array {
 	return $out;
 }
 
-/*
+/**
  * The names a stored passkey stands for: every spelling a backend may
  * take for its owner (see webauthn_username_keys()). Deliberately broad:
  * a passkey that stands for too many names can only refuse someone, one
  * that stands for too few lets another spelling skip the passkey step.
+ * @param WebAuthnCredential $c
+ * @return list<string>
  */
 function webauthn_credential_keys(array $c): array {
 	return webauthn_username_keys(webauthn_normalize_username($c['username'] ?? ''), false);
 }
 
-/* Split a whitespace/comma separated list, dropping empties. */
+/**
+ * Split a whitespace/comma separated list, dropping empties.
+ * @return list<string>
+ */
 function webauthn_split_list(?string $s): array {
-	return array_values(array_filter(preg_split('/[\s,]+/', (string)$s), 'strlen'));
+	return array_values(array_filter(preg_split('/[\s,]+/', (string)$s), fn(string $x) => $x !== ''));
 }
 
 /* Does $ip fall within $cidr (an address or address/prefix, v4 or v6)? */
@@ -338,6 +337,9 @@ function webauthn_ip_in_cidr(string $ip, string $cidr): bool {
 	return (ord($addr[$full]) & $mask) == (ord($net[$full]) & $mask);
 }
 
+/**
+ * @param array<string> $list
+ */
 function webauthn_ip_in_list(string $ip, array $list): bool {
 	foreach ($list as $cidr) {
 		if (webauthn_ip_in_cidr($ip, $cidr)) {
@@ -366,7 +368,7 @@ function webauthn_valid_cidr(string $cidr): bool {
 	return !isset($parts[1]) || (ctype_digit($parts[1]) && (int)$parts[1] <= strlen($bin) * 8);
 }
 
-/*
+/**
  * Describe where a request came from.
  *
  * $server is $_SERVER. CF-Connecting-IP is only believed when the TCP
@@ -379,6 +381,13 @@ function webauthn_valid_cidr(string $cidr): bool {
  *   via_proxy   - the peer is a configured cloudflared address
  *   proxy_headers - the request carries Cloudflare or other reverse-proxy
  *                   headers, i.e. it was forwarded on someone's behalf
+ *   from_firewall - the peer is the firewall itself (loopback, the address
+ *                   the request came in on, or an interface address): a
+ *                   program on the firewall, such as cloudflared, made the
+ *                   connection, possibly for someone on the Internet
+ * @param array<string, mixed> $server
+ * @param WebAuthnSettings $settings
+ * @return WebAuthnSource
  */
 function webauthn_request_source(array $server, array $settings): array {
 	$peer = (string)($server['REMOTE_ADDR'] ?? '');
@@ -395,10 +404,40 @@ function webauthn_request_source(array $server, array $settings): array {
 		'proxy_headers' => isset($server['HTTP_CF_CONNECTING_IP']) || isset($server['HTTP_CF_RAY']) ||
 		    isset($server['HTTP_CF_ACCESS_JWT_ASSERTION']) || isset($server['HTTP_X_FORWARDED_FOR']) ||
 		    isset($server['HTTP_FORWARDED']) || isset($server['HTTP_X_REAL_IP']),
+		'from_firewall' => webauthn_is_firewall_address($peer, (string)($server['SERVER_ADDR'] ?? '')),
 	];
 }
 
 /*
+ * Is $ip the firewall itself? Loopback, the local address of this
+ * connection ($server_addr: a connection from the firewall to itself has
+ * the same address at both ends), or any configured interface address.
+ * Cloudflare's private-network routing (WARP to cloudflared to a LAN IP)
+ * forwards plain TCP without proxy headers, so such connections look like
+ * LAN traffic from the firewall's own address (review finding F2).
+ */
+function webauthn_is_firewall_address(string $ip, string $server_addr): bool {
+	if ($ip === '') {
+		return false;
+	}
+	$own = ['127.0.0.0/8', '::1'];
+	if ($server_addr !== '') {
+		$own[] = $server_addr;
+	}
+	/* pfsense-utils.inc: loaded with authgui.inc, not always elsewhere. */
+	foreach (['get_configured_ip_addresses', 'get_configured_ipv6_addresses'] as $fn) {
+		if (function_exists($fn)) {
+			foreach ($fn() as $addr) {
+				if ((string)$addr !== '') {
+					$own[] = (string)$addr;
+				}
+			}
+		}
+	}
+	return webauthn_ip_in_list($ip, $own);
+}
+
+/**
  * May this request skip the WebAuthn step because it comes from a
  * trusted local network?
  *
@@ -407,21 +446,27 @@ function webauthn_request_source(array $server, array $settings): array {
  * LAN or on pfSense at 127.0.0.1): otherwise every Internet user would
  * inherit the LAN's exemption. Forwarded requests are recognised by the
  * configured cloudflared address and, as a fallback when that is not
- * configured, by proxy headers such as X-Forwarded-For.
+ * configured, by proxy headers such as X-Forwarded-For. Connections from
+ * the firewall's own addresses never qualify either: cloudflared on the
+ * firewall forwards private-network (WARP) traffic from them.
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
  */
 function webauthn_source_is_trusted_network(array $source, array $settings): bool {
-	if ($source['via_proxy'] || $source['proxy_headers'] || $source['peer'] === '') {
+	if ($source['via_proxy'] || $source['proxy_headers'] || !empty($source['from_firewall']) || $source['peer'] === '') {
 		return false;
 	}
 	return webauthn_ip_in_list($source['peer'], webauthn_split_list($settings['trusted_networks']));
 }
 
-/*
+/**
  * Decide what the gate does for a password-authenticated session that
  * has not yet passed WebAuthn.
  *   'skip'     - let the request through without WebAuthn
  *   'require'  - show the WebAuthn challenge
  *   'deny'     - user has no passkey and enforcement is on
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
  */
 function webauthn_gate_decision(array $settings, array $source, bool $has_credentials): string {
 	if (empty($settings['enable'])) {
@@ -436,7 +481,7 @@ function webauthn_gate_decision(array $settings, array $source, bool $has_creden
 	return empty($settings['enforce']) ? 'skip' : 'deny';
 }
 
-/*
+/**
  * Where a GUI session stands with respect to the second factor.
  *   'disabled'  - the second factor is off
  *   'verified'  - passed WebAuthn in this login, recently enough, with a
@@ -448,6 +493,9 @@ function webauthn_gate_decision(array $settings, array $source, bool $has_creden
  *   'require'   - must pass WebAuthn now
  *   'deny'      - no passkey and enforcement is on
  * $session is $_SESSION.
+ * @param WebAuthnSession $session
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
  */
 function webauthn_session_status(array $settings, array $session, array $source): string {
 	if (empty($settings['enable'])) {
@@ -481,11 +529,13 @@ function webauthn_session_status(array $settings, array $session, array $source)
 	return $status;
 }
 
-/*
+/**
  * Is a stored passkey verification still good? It must belong to this
  * PHP session (pfSense gives every password sign-in a new session ID, so
  * a new sign-in never inherits it), be at most WEBAUTHN_VERIFIED_MAX_AGE
  * old, and match the current RP ID and user verification setting.
+ * @param WebAuthnSettings $settings
+ * @param array<string, mixed> $state
  */
 function webauthn_verified_state_valid(array $state, array $settings): bool {
 	$time = (int)($state['time'] ?? 0);
@@ -496,17 +546,23 @@ function webauthn_verified_state_valid(array $state, array $settings): bool {
 	    (!webauthn_require_uv($settings) || !empty($state['uv']));
 }
 
-/* The session state recorded after a successful passkey verification. Call after session_regenerate_id(). */
+/**
+ * The session state recorded after a successful passkey verification. Call after session_regenerate_id().
+ * @param WebAuthnCredential $cred
+ * @param WebAuthnSettings $settings
+ * @return array<string, mixed>
+ */
 function webauthn_verified_state(string $user, array $cred, bool $uv, array $settings): array {
 	return ['user' => $user, 'method' => 'webauthn', 'credential' => (string)$cred['id'], 'time' => time(),
 	    'sid' => webauthn_session_sid(), 'rp_id' => webauthn_rp_id($settings), 'uv' => $uv];
 }
 
-/*
+/**
  * Does the session's user have passkeys? For remote accounts, another
  * spelling with passkeys counts too: it must not skip the step. Without
  * intl/mbstring other spellings cannot be recognised reliably, so then
  * any passkey at all counts for remote accounts (fail closed).
+ * @param WebAuthnSession $session
  */
 function webauthn_session_has_credentials(array $session): bool {
 	$user = webauthn_session_identity($session);
@@ -527,13 +583,16 @@ function webauthn_session_has_credentials(array $session): bool {
 	return !empty(webauthn_case_variant_credentials($user));
 }
 
-/*
+/**
  * May this session register a passkey? Once the account (or, for remote
  * accounts, another spelling of it) has a passkey, only a session that
  * signed in with one may add another. Otherwise a password alone, from a
  * trusted network or while enforcement is off, would be enough to enrol
  * an attacker's passkey for later use through the tunnel. While the
  * second factor is off nobody is verified, so then only an admin may.
+ * @param WebAuthnSession $session
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
  */
 function webauthn_may_register(array $settings, array $session, array $source, bool $is_admin = false): bool {
 	if (!webauthn_session_has_credentials($session)) {
@@ -543,13 +602,16 @@ function webauthn_may_register(array $settings, array $session, array $source, b
 	return $status === 'verified' || ($status === 'disabled' && $is_admin);
 }
 
-/*
+/**
  * May this session remove passkey $id? Admins may always (the recovery
  * path from a trusted network). Other users may not remove their last
  * usable passkey without a session verified with a passkey: a password
  * alone would otherwise switch the passkey step off for the account.
  * For the page only; webauthn_delete_credential() decides again under
  * the config lock.
+ * @param WebAuthnSession $session
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
  */
 function webauthn_may_delete(array $settings, array $session, array $source, string $id, bool $is_admin): bool {
 	if ($is_admin) {
@@ -562,12 +624,19 @@ function webauthn_may_delete(array $settings, array $session, array $source, str
 	return !empty($left) || webauthn_session_status($settings, $session, $source) === 'verified';
 }
 
+/**
+ * @param WebAuthnSettings|null $settings
+ */
 function webauthn_rp_id(?array $settings = null): string {
 	$settings = $settings ?? webauthn_settings();
 	return strtolower(trim($settings['rp_id']));
 }
 
-/* Origins accepted in clientDataJSON. Defaults to https://<rp_id>. */
+/**
+ * Origins accepted in clientDataJSON. Defaults to https://<rp_id>.
+ * @param WebAuthnSettings|null $settings
+ * @return list<string>
+ */
 function webauthn_allowed_origins(?array $settings = null): array {
 	$settings = $settings ?? webauthn_settings();
 	$origins = array_map('webauthn_normalize_origin', webauthn_split_list($settings['origins']));
@@ -577,12 +646,19 @@ function webauthn_allowed_origins(?array $settings = null): array {
 	return $origins;
 }
 
+/**
+ * @param WebAuthnSettings|null $settings
+ */
 function webauthn_require_uv(?array $settings = null): bool {
 	$settings = $settings ?? webauthn_settings();
 	return $settings['user_verification'] === 'required';
 }
 
-/* Validate settings submitted from the GUI. Returns a list of errors. */
+/**
+ * Validate settings submitted from the GUI. Returns a list of errors.
+ * @param WebAuthnSettings $s
+ * @return list<string>
+ */
 function webauthn_validate_settings(array $s): array {
 	$errors = [];
 	$rp_id = strtolower(trim($s['rp_id'] ?? ''));
@@ -615,7 +691,10 @@ function webauthn_validate_settings(array $s): array {
 	 * traffic is never exempt), but a huge network (however written, e.g.
 	 * /00) would exempt or admit a large part of the Internet. */
 	$trusted = webauthn_split_list($s['trusted_networks'] ?? '');
-	foreach (['trusted_networks' => gettext('Trusted network'), 'xmlrpc_peers' => gettext('XMLRPC peer')] as $field => $label) {
+	/* A huge cloudflared source would make CF-Connecting-IP believed from
+	 * anyone, so logged client addresses could be forged (finding F6). */
+	foreach (['trusted_networks' => gettext('Trusted network'), 'xmlrpc_peers' => gettext('XMLRPC peer'),
+	    'trusted_proxies' => gettext('cloudflared source')] as $field => $label) {
 		foreach (webauthn_split_list($s[$field] ?? '') as $c) {
 			if (webauthn_valid_cidr($c) && webauthn_cidr_too_large($c)) {
 				$errors[] = sprintf(gettext('%1$s entry %2$s is too large: use at least /8 for IPv4 and /16 for IPv6.'),
@@ -634,10 +713,13 @@ function webauthn_validate_settings(array $s): array {
 	return $errors;
 }
 
-/*
+/**
  * Would saving $new lock out the admin saving it, from where they are
  * ($source, under the new settings), given their passkeys $mine? Returns
  * the error message, or null.
+ * @param array<WebAuthnCredential> $mine
+ * @param WebAuthnSettings $new
+ * @param WebAuthnSource $source
  */
 function webauthn_settings_lockout_error(array $new, array $source, array $mine): ?string {
 	if (empty($new['enable']) || webauthn_source_is_trusted_network($source, $new)) {
@@ -652,21 +734,34 @@ function webauthn_settings_lockout_error(array $new, array $source, array $mine)
 	return null;
 }
 
-/*
+/**
  * Log to syslog with the USER facility and a message format that does
  * not match sshguard's "webConfigurator authentication error" pattern,
  * so WebAuthn failures never add the cloudflared address (shared by all
  * tunnel users) to the GUI lockout table.
+ * @param WebAuthnSource|null $source
  */
 function webauthn_log(int $level, string $message, ?array $source = null): void {
+	syslog(LOG_USER | $level, webauthn_log_line($message, $source));
+}
+
+/**
+ * The syslog line for $message. Parts of it can come from the client (an
+ * origin, an LDAP sign-in name), so it is made plain text first: one line,
+ * no control or format characters (such as bidi overrides), bounded length
+ * (review finding F5). The source address is added after that, so it is
+ * always the last thing on the line.
+ * @param WebAuthnSource|null $source
+ */
+function webauthn_log_line(string $message, ?array $source = null): string {
+	$message = webauthn_plain($message, 400);
 	if ($source !== null) {
 		$message .= ' from ' . $source['client'];
 		if ($source['via_proxy']) {
 			$message .= ' (via cloudflared ' . $source['peer'] . ')';
 		}
 	}
-	$message = preg_replace('/[\x00-\x1f\x7f]/', ' ', $message);
-	syslog(LOG_USER | $level, 'webauthn: ' . $message);
+	return 'webauthn: ' . $message;
 }
 
 /*

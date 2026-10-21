@@ -51,11 +51,12 @@ function webauthn_new_challenge(string $purpose, string $username): string {
 	return $payload . webauthn_challenge_mac($purpose, $username, $payload);
 }
 
-/*
+/**
  * Check the challenge the browser signed (taken from clientDataJSON):
  * HMAC for this session, user and purpose, and expiry. Returns
  * [challenge, nonce, expires] or null. A challenge expiring further ahead
  * than a fresh one would (the clock went back) is refused too.
+ * @return array{0: string, 1: string, 2: int}|null
  */
 function webauthn_parse_challenge(string $purpose, string $username, string $client_data_json, int $now): ?array {
 	$cd = json_decode($client_data_json, true);
@@ -78,7 +79,7 @@ function webauthn_parse_challenge(string $purpose, string $username, string $cli
 	return [$challenge, bin2hex(substr($payload, 0, 16)), $expires];
 }
 
-/*
+/**
  * Run $verify($challenge) for the challenge in clientDataJSON while
  * holding the used-challenge lock, and record the challenge as used only
  * if $verify returns (an exception aborts without recording it). So only
@@ -87,6 +88,7 @@ function webauthn_parse_challenge(string $purpose, string $username, string $cli
  * not even by two parallel requests. Returns $verify's result, or null if
  * the challenge is forged, expired, for another session/user/purpose,
  * already used, or its use cannot be recorded (fail closed).
+ * @return mixed
  */
 function webauthn_use_challenge(string $purpose, string $username, string $client_data_json, callable $verify) {
 	$now = time();
@@ -118,11 +120,12 @@ function webauthn_use_challenge(string $purpose, string $username, string $clien
 	}, null);
 }
 
-/*
+/**
  * Unexpired used nonces (nonce => expiry); null when the list cannot be
  * trusted: a damaged list may hold nonces that are still valid, so it is
  * refused until every challenge it could hold has expired. Call with the
  * used-challenge lock held.
+ * @return array<string, mixed>|null
  */
 function webauthn_used_nonces(int $now): ?array {
 	$raw = @file_get_contents(WEBAUTHN_USED_FILE);

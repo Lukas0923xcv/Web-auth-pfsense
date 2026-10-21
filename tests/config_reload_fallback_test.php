@@ -1,12 +1,13 @@
 <?php
 /*
  * Finding 3 on pfSense versions without config_read_file() (2.7.x):
- *   php tests/review4/reload_fallback.php
+ *   php tests/config_reload_fallback_test.php
  * The config is reloaded with pfSense's parse_xml_config(); if that
  * fails, the change is not made (fail closed).
  */
 $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-r4f-count.json");
+define('WEBAUTHN_FAILURE_FILE', "$tmp/webauthn-r4f-failures.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-r4f.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-r4f-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-r4f-revoked.json");
@@ -51,7 +52,7 @@ function parse_xml_config($file, $root) {
 if (!function_exists('gettext')) {
 	function gettext($s) { return $s; }
 }
-require_once(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/webauthn.inc');
+require_once(dirname(__DIR__) . '/src/usr/local/pkg/webauthn/webauthn.inc');
 
 $failures = 0;
 $count = 0;

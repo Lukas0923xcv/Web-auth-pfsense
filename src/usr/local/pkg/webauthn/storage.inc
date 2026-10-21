@@ -11,10 +11,11 @@
 
 /* Loaded by webauthn.inc, which defines the constants used here. */
 
-/*
+/**
  * All stored credentials as a list, without revoked ones. <item> is a
  * pfSense list tag, so it always parses as a list; wrap a bare element
  * anyway in case one was written by hand.
+ * @return list<WebAuthnCredential>
  */
 function webauthn_all_credentials(): array {
 	$all = config_get_path(WEBAUTHN_CRED_PATH, []);
@@ -27,14 +28,15 @@ function webauthn_all_credentials(): array {
 	/* A damaged list still lets every passkey count as present (no skipping); webauthn_find_credential() then refuses them all. */
 	$revoked = webauthn_revoked_ids() ?? [];
 	return array_values(array_filter($all, function ($c) use ($revoked) {
-		return is_array($c) && !isset($revoked[(string)($c['id'] ?? '')]);
+		return is_array($c) && !webauthn_is_revoked($c, $revoked);
 	}));
 }
 
-/*
+/**
  * Credentials of $username (all if null). Passkeys registered by a local
  * account record its uid; once that account is deleted and a new one
  * gets the same name, they no longer count (see webauthn_orphaned()).
+ * @return list<WebAuthnCredential>
  */
 function webauthn_get_credentials(?string $username = null): array {
 	$out = [];
@@ -47,7 +49,10 @@ function webauthn_get_credentials(?string $username = null): array {
 	return $out;
 }
 
-/* Was $c registered by a local account that no longer exists (same name, other uid, or gone)? */
+/**
+ * Was $c registered by a local account that no longer exists (same name, other uid, or gone)?
+ * @param WebAuthnCredential $c
+ */
 function webauthn_orphaned(array $c): bool {
 	if (!isset($c['uid']) || $c['uid'] === '') {
 		return false;
@@ -78,10 +83,11 @@ function webauthn_config_update(callable $change, string $desc, ?callable $after
 	}, false);
 }
 
-/*
+/**
  * Hash of the package's part of a config ($section, default: in memory).
  * Normalised as config.xml stores it: empty lists dropped, values as
  * strings, so a save and its re-read hash alike.
+ * @param mixed $section
  */
 function webauthn_config_hash($section = null): string {
 	$norm = function ($v) use (&$norm) {
@@ -101,7 +107,10 @@ function webauthn_config_hash($section = null): string {
 	return hash('sha256', serialize($norm(is_array($section) ? $section : [])));
 }
 
-/* The package's part of config.xml as it is on disk now; null if it cannot be read. */
+/**
+ * The package's part of config.xml as it is on disk now; null if it cannot be read.
+ * @return array<mixed>|null
+ */
 function webauthn_disk_section(): ?array {
 	if (!function_exists('parse_xml_config') || !function_exists('g_get')) {
 		return null;
@@ -185,9 +194,10 @@ function webauthn_config_reload(): bool {
 	return true;
 }
 
-/*
+/**
  * Store a new passkey. Returns null on success, or an error message.
  * $uid: the pfSense uid of a local account, '' for remote accounts.
+ * @param array{credential_id: string, alg: int, pem: string, sign_count: int, uv: bool} $reg
  */
 function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id, string $uid = ''): ?string {
 	$id = webauthn_b64url_encode($reg['credential_id']);
@@ -200,16 +210,25 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 			$error = gettext('The list of removed passkeys is damaged; see the system log.');
 			return false;
 		}
+		$new_key = webauthn_public_key_hash(base64_encode($reg['pem']));
+		$entry = $revoked[$id] ?? null;
+		if ($entry !== null && (!is_array($entry) || in_array($new_key, (array)($entry['keys'] ?? []), true))) {
+			/* The same key under the same ID is the removed passkey itself
+			 * (or a copy of it); a whole-ID revocation (older versions)
+			 * cannot tell keys apart. Neither comes back. */
+			$error = gettext('This passkey was removed earlier and cannot be registered again.');
+			return false;
+		}
 		$own = 0;
 		foreach ($all as $i => $c) {
 			if (($c['id'] ?? null) === $id) {
-				if (!isset($revoked[$id])) {
+				if (!webauthn_is_revoked($c, $revoked)) {
 					$error = gettext('This passkey is already registered.');
 					return false;
 				}
 				/* A revoked record brought back (e.g. by a restore) is replaced. */
 				unset($all[$i]);
-			} elseif (!isset($revoked[(string)($c['id'] ?? '')]) && !webauthn_orphaned($c) &&
+			} elseif (!webauthn_is_revoked($c, $revoked) && !webauthn_orphaned($c) &&
 			    webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username)) {
 				$own++;
 			}
@@ -239,16 +258,7 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 		}
 		$all[] = $rec;
 		config_set_path(WEBAUTHN_CRED_PATH, $all);
-	}, sprintf('WebAuthn: registered passkey "%s" for user "%s"', webauthn_plain($name), webauthn_plain($username)),
-	    function () use ($id, &$error) {
-		/* Only now, with the record that replaces any revoked one saved (and
-		 * still under the lock): lifting the revocation earlier would revive
-		 * that old record if the save failed. */
-		if (!webauthn_unrevoke($id)) {
-			$error = gettext('The passkey was saved but cannot be used yet: the list of removed passkeys could not be updated.');
-			return false;
-		}
-	});
+	}, sprintf('WebAuthn: registered passkey "%s" for user "%s"', webauthn_plain($name), webauthn_plain($username)));
 	if (!$ok) {
 		return $error ?? gettext('The configuration could not be saved.');
 	}
@@ -257,9 +267,9 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 
 /*
  * Delete a credential; restrict to $username unless null (admin). Every
- * record with that ID goes, and the ID is revoked first, so it is never
- * accepted again even if the change cannot be saved or a config restore
- * brings it back. Unless $may_remove_last, the account must keep another
+ * matching record with that ID goes, and its key is revoked first, so it
+ * is never accepted again even if the change cannot be saved or a config
+ * restore brings it back. Unless $may_remove_last, the account must keep another
  * usable passkey (for the current RP ID). All of it is decided under the
  * config lock on the reloaded config, so parallel removals cannot each
  * leave the other passkey as "the one left". True only if the change was
@@ -286,12 +296,18 @@ function webauthn_delete_credential(string $id, ?string $username = null, bool $
 				return false;
 			}
 		}
-		if (!webauthn_revoke($id)) {
+		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
+		$all = is_array($all) ? (isset($all['id']) && !is_array($all['id']) ? [$all] : $all) : [];
+		$keys = [];
+		foreach ($all as $c) {
+			if ($match($c)) {
+				$keys[] = webauthn_public_key_hash((string)($c['publickey'] ?? ''));
+			}
+		}
+		if (!webauthn_revoke($id, $keys)) {
 			$error = gettext('The passkey could not be revoked. Check the system log.');
 			return false;
 		}
-		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
-		$all = is_array($all) ? (isset($all['id']) && !is_array($all['id']) ? [$all] : $all) : [];
 		$keep = [];
 		foreach ($all as $c) {
 			if (is_array($c) && !$match($c)) {
@@ -323,17 +339,27 @@ function webauthn_delete_credential(string $id, ?string $username = null, bool $
 	return true;
 }
 
-/* Save the settings under the config lock. */
+/**
+ * Save the settings under the config lock.
+ * @param WebAuthnSettings $new
+ */
 function webauthn_save_settings(array $new): bool {
 	return webauthn_config_update(function () use ($new) {
 		config_set_path(WEBAUTHN_CONFIG_PATH, $new);
 	}, gettext('WebAuthn: settings changed'));
 }
 
-/*
- * Revoked credential IDs as a set (id => time); null if the file exists
- * but cannot be read as such (it is only ever replaced whole, so this
- * means outside damage): then no passkey is accepted (fail closed).
+/**
+ * Removed passkeys: credential ID => ['t' => time, 'keys' => hashes of
+ * the public keys removed under that ID] (a bare time, written by older
+ * versions, revokes every key under the ID). Null if the file exists but
+ * cannot be read as such (it is only ever replaced whole, so this means
+ * outside damage): then no passkey is accepted (fail closed).
+ *
+ * Revocation is by ID and key: registering the same ID again with a new
+ * key, under any account, never makes a removed record valid again, even
+ * when a config restore brings that record back.
+ * @return array<mixed>|null
  */
 function webauthn_revoked_ids(): ?array {
 	$raw = @file_get_contents(WEBAUTHN_REVOKED_FILE);
@@ -344,38 +370,50 @@ function webauthn_revoked_ids(): ?array {
 	return is_array($data) ? $data : null;
 }
 
-function webauthn_revoke(string $id): bool {
-	return webauthn_with_lock(WEBAUTHN_REVOKED_FILE, function () use ($id) {
-		$data = webauthn_revoked_ids();
-		if ($data === null) {
-			return false;
-		}
-		$data[$id] = time();
-		return webauthn_write_json(WEBAUTHN_REVOKED_FILE, $data);
-	});
+function webauthn_public_key_hash(string $publickey): string {
+	return hash('sha256', $publickey);
 }
 
-/* Registering the same credential ID again makes it valid again (authenticators normally create new IDs). */
-function webauthn_unrevoke(string $id): bool {
-	return webauthn_with_lock(WEBAUTHN_REVOKED_FILE, function () use ($id) {
+/**
+ * Is stored record $c revoked according to $revoked (webauthn_revoked_ids())?
+ * @param WebAuthnCredential $c
+ * @param array<mixed> $revoked
+ */
+function webauthn_is_revoked(array $c, array $revoked): bool {
+	$entry = $revoked[(string)($c['id'] ?? '')] ?? null;
+	if ($entry === null) {
+		return false;
+	}
+	return !is_array($entry) || in_array(webauthn_public_key_hash((string)($c['publickey'] ?? '')), (array)($entry['keys'] ?? []), true);
+}
+
+/**
+ * Revoke the keys $keys (public key hashes) under credential ID $id.
+ * @param array<string> $keys
+ */
+function webauthn_revoke(string $id, array $keys): bool {
+	return webauthn_with_lock(WEBAUTHN_REVOKED_FILE, function () use ($id, $keys) {
 		$data = webauthn_revoked_ids();
 		if ($data === null) {
 			return false;
 		}
-		if (!isset($data[$id])) {
+		$old = $data[$id] ?? null;
+		if ($old !== null && !is_array($old)) {
+			/* Already revoked for every key. */
 			return true;
 		}
-		unset($data[$id]);
+		$data[$id] = ['t' => time(), 'keys' => array_values(array_unique(array_merge((array)($old['keys'] ?? []), $keys)))];
 		return webauthn_write_json(WEBAUTHN_REVOKED_FILE, $data);
 	});
 }
 
-/*
+/**
  * Signature counters are kept outside config.xml so that every login
  * does not create a configuration revision. A damaged counter file is
  * not read as empty (that would reset every counter): counters are then
  * neither checked nor stored, so passkey sign-ins fail until it is
  * repaired or removed.
+ * @return array<mixed>|null
  */
 function webauthn_read_counters(): ?array {
 	$raw = @file_get_contents(WEBAUTHN_COUNTER_FILE);
@@ -430,7 +468,11 @@ function webauthn_advance_sign_count(string $id, int $count): bool {
 	}, false);
 }
 
-/* Run $fn holding an exclusive lock on "$file.lock"; $fail if the lock cannot be taken. */
+/**
+ * Run $fn holding an exclusive lock on "$file.lock"; $fail if the lock cannot be taken.
+ * @param mixed $fail
+ * @return mixed
+ */
 function webauthn_with_lock(string $file, callable $fn, $fail = false) {
 	$old = umask(077);
 	$lock = @fopen($file . '.lock', 'c');
@@ -450,10 +492,11 @@ function webauthn_with_lock(string $file, callable $fn, $fail = false) {
 	}
 }
 
-/*
+/**
  * Replace $file with $data as JSON through a temp file of this process
  * and rename, so a failed write (e.g. a full disk) never leaves a
  * truncated file behind. The file is mode 0600.
+ * @param array<mixed> $data
  */
 function webauthn_write_json(string $file, array $data): bool {
 	$json = json_encode($data);
@@ -476,7 +519,10 @@ function webauthn_write_json(string $file, array $data): bool {
 	return $ok;
 }
 
-/* Find a usable stored credential for $username by its base64url ID. */
+/**
+ * Find a usable stored credential for $username by its base64url ID.
+ * @return WebAuthnCredential|null
+ */
 function webauthn_find_credential(string $username, string $id): ?array {
 	if (webauthn_revoked_ids() === null) {
 		static $logged = false;
@@ -494,4 +540,117 @@ function webauthn_find_credential(string $username, string $id): ?array {
 		}
 	}
 	return null;
+}
+
+/**
+ * Failed passkey attempts per account and client address, kept in
+ * WEBAUTHN_FAILURE_FILE so that a new session or another password login
+ * cannot reset them: key => ['n' => attempts, 't' => time of the last
+ * one, 'u' => account hash]. An entry expires WEBAUTHN_FAILURE_WINDOW
+ * seconds after its last attempt. Null if the file is damaged: then every
+ * account counts as locked (fail closed) until the file is repaired or
+ * removed.
+ *
+ * The limit is per client address, not for the whole account: anyone who
+ * knows the password could otherwise keep the real user locked out by
+ * failing on purpose (review finding F1). The account-wide total only
+ * raises a notice.
+ * @return array<string, array{n: int, t: int, u: string}>|null
+ */
+function webauthn_read_failures(int $now): ?array {
+	$raw = @file_get_contents(WEBAUTHN_FAILURE_FILE);
+	if ($raw === false) {
+		return file_exists(WEBAUTHN_FAILURE_FILE) ? null : [];
+	}
+	$data = json_decode($raw, true);
+	$valid = is_array($data);
+	foreach ($valid ? $data : [] as $e) {
+		$valid = $valid && is_array($e) && is_int($e['n'] ?? null) && is_int($e['t'] ?? null) && is_string($e['u'] ?? null);
+	}
+	if (!$valid) {
+		static $logged = false;
+		if (!$logged) {
+			$logged = true;
+			webauthn_log(LOG_ERR, WEBAUTHN_FAILURE_FILE . ' is damaged: passkey sign-ins are refused until it is repaired or removed');
+		}
+		return null;
+	}
+	return array_filter($data, function ($e) use ($now) {
+		return $e['t'] > $now - WEBAUTHN_FAILURE_WINDOW;
+	});
+}
+
+function webauthn_failure_user_hash(string $user): string {
+	return substr(hash('sha256', webauthn_normalize_username($user)), 0, 32);
+}
+
+function webauthn_failure_key(string $user, string $client): string {
+	return substr(hash('sha256', webauthn_normalize_username($user) . "\0" . $client), 0, 32);
+}
+
+/*
+ * Seconds until $user may try a passkey again from $client; 0 if they may
+ * now. A damaged attempt list counts as locked for the whole window.
+ */
+function webauthn_failure_lock_remaining(string $user, string $client): int {
+	$now = time();
+	$data = webauthn_read_failures($now);
+	if ($data === null) {
+		return WEBAUTHN_FAILURE_WINDOW;
+	}
+	$e = $data[webauthn_failure_key($user, $client)] ?? null;
+	if ($e === null || $e['n'] < WEBAUTHN_MAX_USER_FAILURES) {
+		return 0;
+	}
+	return max(1, $e['t'] + WEBAUTHN_FAILURE_WINDOW - $now);
+}
+
+/* Failed attempts for $user from all addresses in the window (for the notice). */
+function webauthn_failure_account_total(string $user): int {
+	$total = 0;
+	foreach (webauthn_read_failures(time()) ?? [] as $e) {
+		$total += ($e['u'] === webauthn_failure_user_hash($user)) ? $e['n'] : 0;
+	}
+	return $total;
+}
+
+/*
+ * Count a passkey attempt for $user from $client before it is verified;
+ * a successful one is uncounted again by webauthn_failure_clear().
+ * Counting first means a failure needs no write: if the attempt cannot be
+ * recorded (the list is damaged, /conf is full, the lock cannot be taken)
+ * or the limit is used up, this returns false and the attempt must not be
+ * verified at all (fail closed).
+ */
+function webauthn_failure_begin(string $user, string $client): bool {
+	return webauthn_with_lock(WEBAUTHN_FAILURE_FILE, function () use ($user, $client) {
+		$now = time();
+		$data = webauthn_read_failures($now);
+		if ($data === null) {
+			return false;
+		}
+		$k = webauthn_failure_key($user, $client);
+		$n = $data[$k]['n'] ?? 0;
+		if ($n >= WEBAUTHN_MAX_USER_FAILURES) {
+			return false;
+		}
+		$data[$k] = ['n' => $n + 1, 't' => $now, 'u' => webauthn_failure_user_hash($user)];
+		return webauthn_write_json(WEBAUTHN_FAILURE_FILE, $data);
+	}, false);
+}
+
+/* Forget $user's attempts from $client after a successful passkey sign-in there. */
+function webauthn_failure_clear(string $user, string $client): void {
+	webauthn_with_lock(WEBAUTHN_FAILURE_FILE, function () use ($user, $client) {
+		$k = webauthn_failure_key($user, $client);
+		$data = webauthn_read_failures(time());
+		if ($data === null || !isset($data[$k])) {
+			return;
+		}
+		unset($data[$k]);
+		if (!webauthn_write_json(WEBAUTHN_FAILURE_FILE, $data)) {
+			/* Only means this success still counts as one attempt. */
+			webauthn_log(LOG_WARNING, 'could not update ' . WEBAUTHN_FAILURE_FILE);
+		}
+	});
 }

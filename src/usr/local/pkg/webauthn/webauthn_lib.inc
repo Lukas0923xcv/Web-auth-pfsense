@@ -24,6 +24,9 @@ define('WEBAUTHN_ALG_RS256', -257);
 
 define('WEBAUTHN_FLAG_UP', 0x01);
 define('WEBAUTHN_FLAG_UV', 0x04);
+/* Backup eligibility and backup state (WebAuthn Level 3). */
+define('WEBAUTHN_FLAG_BE', 0x08);
+define('WEBAUTHN_FLAG_BS', 0x10);
 define('WEBAUTHN_FLAG_AT', 0x40);
 define('WEBAUTHN_FLAG_ED', 0x80);
 
@@ -42,7 +45,10 @@ function webauthn_b64url_decode(string $data): string {
 	return $out;
 }
 
-/* Algorithms this server can verify, in order of preference. */
+/**
+ * Algorithms this server can verify, in order of preference.
+ * @return list<int>
+ */
 function webauthn_supported_algs(): array {
 	$algs = [WEBAUTHN_ALG_ES256];
 	if (function_exists('sodium_crypto_sign_verify_detached')) {
@@ -79,10 +85,11 @@ function webauthn_normalize_origin(string $origin): string {
 	return strtolower(rtrim(trim($origin), '/'));
 }
 
-/*
+/**
  * Parse authenticator data (WebAuthn §6.1).
  * Returns rp_id_hash, flags, sign_count and, if the AT flag is set,
  * aaguid, credential_id and credential_public_key (decoded COSE map).
+ * @return array{rp_id_hash: string, flags: int, sign_count: int, aaguid?: string, credential_id?: string, credential_public_key?: mixed}
  */
 function webauthn_parse_auth_data(string $raw): array {
 	if (strlen($raw) < 37) {
@@ -151,6 +158,9 @@ function webauthn_pem(string $der): string {
 	return "-----BEGIN PUBLIC KEY-----\n" . chunk_split(base64_encode($der), 64, "\n") . "-----END PUBLIC KEY-----\n";
 }
 
+/**
+ * @param array<int|string, mixed> $cose
+ */
 function webauthn_cose_bytes(array $cose, int $label, ?int $want_len = null): string {
 	if (!isset($cose[$label]) || !($cose[$label] instanceof WebAuthnCborBytes)) {
 		throw new WebAuthnException("COSE key parameter {$label} missing");
@@ -162,8 +172,10 @@ function webauthn_cose_bytes(array $cose, int $label, ?int $want_len = null): st
 	return $b;
 }
 
-/*
+/**
  * Convert a COSE_Key map to ['alg' => int, 'pem' => PEM SPKI].
+ * @param array<int|string, mixed> $cose
+ * @return array{alg: int, pem: string}
  */
 function webauthn_cose_to_pem(array $cose): array {
 	$kty = $cose[1] ?? null;
@@ -202,6 +214,8 @@ function webauthn_cose_to_pem(array $cose): array {
 		$algid = hex2bin('300d06092a864886f70d0101010500');
 		$der = webauthn_der(0x30, $algid . webauthn_der(0x03, "\0" . $rsa));
 		break;
+	default:
+		throw new WebAuthnException('Unsupported credential algorithm ' . var_export($alg, true));
 	}
 	$pem = webauthn_pem($der);
 	if ($alg != WEBAUTHN_ALG_EDDSA && openssl_pkey_get_public($pem) === false) {
@@ -210,6 +224,12 @@ function webauthn_cose_to_pem(array $cose): array {
 	return ['alg' => $alg, 'pem' => $pem];
 }
 
+/*
+ * Verify $sig over $data with the stored key. The key must be of the kind
+ * the stored algorithm names (an EC P-256 key for ES256, RSA of at least
+ * 2048 bits for RS256, Ed25519 for EdDSA): a record whose algorithm and
+ * key disagree is refused rather than verified with the wrong scheme.
+ */
 function webauthn_verify_signature(int $alg, string $pem, string $data, string $sig): bool {
 	switch ($alg) {
 	case WEBAUTHN_ALG_ES256:
@@ -218,20 +238,36 @@ function webauthn_verify_signature(int $alg, string $pem, string $data, string $
 		if ($key === false) {
 			return false;
 		}
+		$details = openssl_pkey_get_details($key);
+		if (!is_array($details)) {
+			return false;
+		}
+		if ($alg == WEBAUTHN_ALG_ES256 && ($details['type'] !== OPENSSL_KEYTYPE_EC ||
+		    ($details['ec']['curve_name'] ?? '') !== 'prime256v1')) {
+			return false;
+		}
+		if ($alg == WEBAUTHN_ALG_RS256 && ($details['type'] !== OPENSSL_KEYTYPE_RSA || $details['bits'] < 2048)) {
+			return false;
+		}
 		return openssl_verify($data, $sig, $key, OPENSSL_ALGO_SHA256) === 1;
 	case WEBAUTHN_ALG_EDDSA:
 		if (!function_exists('sodium_crypto_sign_verify_detached') || strlen($sig) != 64) {
 			return false;
 		}
-		$der = base64_decode(preg_replace('/-----[^-]+-----|\s/', '', $pem));
-		$raw = substr($der, -32);
-		return sodium_crypto_sign_verify_detached($sig, $data, $raw);
+		$der = base64_decode(preg_replace('/-----[^-]+-----|\s/', '', $pem), true);
+		/* SubjectPublicKeyInfo of an Ed25519 key: fixed prefix and 32 key bytes. */
+		if (!is_string($der) || strlen($der) != 44 || substr($der, 0, 12) !== hex2bin('302a300506032b6570032100')) {
+			return false;
+		}
+		return sodium_crypto_sign_verify_detached($sig, $data, substr($der, 12));
 	}
 	return false;
 }
 
-/*
+/**
  * Validate collectedClientData (WebAuthn §7.1 steps 5-12 / §7.2 steps 10-15).
+ * @param array<string> $allowed_origins
+ * @return array<string, mixed>
  */
 function webauthn_check_client_data(string $client_data_json, string $type, string $challenge, array $allowed_origins): array {
 	$cd = json_decode($client_data_json, true);
@@ -262,12 +298,18 @@ function webauthn_check_flags(int $flags, bool $require_uv): void {
 	if ($require_uv && !($flags & WEBAUTHN_FLAG_UV)) {
 		throw new WebAuthnException('User verification required but not performed');
 	}
+	/* §7.1 step 16 / §7.2 step 18: a credential that may not be backed up cannot be in a backup. */
+	if (($flags & WEBAUTHN_FLAG_BS) && !($flags & WEBAUTHN_FLAG_BE)) {
+		throw new WebAuthnException('Backup state flag set without backup eligibility');
+	}
 }
 
-/*
+/**
  * Verify a registration (navigator.credentials.create()) response.
  * Returns ['credential_id' => raw, 'alg' => int, 'pem' => string,
  *          'sign_count' => int, 'uv' => bool].
+ * @param array<string> $allowed_origins
+ * @return array{credential_id: string, alg: int, pem: string, sign_count: int, uv: bool}
  */
 function webauthn_verify_registration(string $client_data_json, string $attestation_object,
     string $challenge, string $rp_id, array $allowed_origins, bool $require_uv): array {
@@ -299,11 +341,15 @@ function webauthn_verify_registration(string $client_data_json, string $attestat
 	];
 }
 
-/*
+/**
  * Verify an assertion (navigator.credentials.get()) response against a
  * stored credential (['alg' => int, 'pem' => string, 'sign_count' => int]).
  * Returns the new signature counter. $info, if passed, receives
  * ['flags' => int, 'uv' => bool] of the verified authenticator data.
+ * @param array<string, mixed> $credential
+ * @param array<string> $allowed_origins
+ * @param array{flags: int, uv: bool}|null $info
+ * @param-out array{flags: int, uv: bool} $info
  */
 function webauthn_verify_assertion(array $credential, string $client_data_json, string $authenticator_data,
     string $signature, string $challenge, string $rp_id, array $allowed_origins, bool $require_uv, ?array &$info = null): int {

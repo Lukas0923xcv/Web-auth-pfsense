@@ -4,13 +4,18 @@ This package controls who gets admin access to a firewall. Please read this befo
 
 ## Review status
 
-**No human has audited this code yet.** It was written with an AI assistant and went through several AI-driven review rounds. The test suite (`tests/`) covers what those reviews found, and it runs on every push. That catches regressions, but it does not replace a review by someone who knows WebAuthn and pfSense.
+**No human has audited this code yet.** It was written with an AI assistant and went through several AI-driven review rounds; the latest one is recorded below. The test suite covers every finding and runs on every push. That catches regressions, but it does not replace a review by someone who knows WebAuthn and pfSense.
 
-If you review it, please open an issue with what you looked at and what you found, even if you found nothing. A record of independent reviews is the most useful thing this project can get.
+If you review it, start with [docs/REVIEW-GUIDE.md](docs/REVIEW-GUIDE.md), and please open an issue with what you looked at and what you found, even if you found nothing. Human reviews will be linked here.
+
+| Date | Reviewer | Scope | Result |
+|---|---|---|---|
+| 2026-10-21 | AI adversarial review (separate agent, no access to the authoring context) | gate, webauthn, challenge, storage, xmlrpc_guard | 2 medium, 2 low, 2 info; all fixed, see below |
+| — | *human review wanted* | | |
 
 ## Reporting a vulnerability
 
-Please do **not** open a public issue for a vulnerability. Use GitHub's private reporting instead: **Security > Report a vulnerability** on the repository page. Include the pfSense version, the package version (`/usr/local/pkg/webauthn/hook.php status`) and the steps to reproduce.
+Please do **not** open a public issue for a vulnerability. Use GitHub's private reporting: **Security > Report a vulnerability** on the repository page. Include the pfSense version, the package version (`/usr/local/pkg/webauthn/hook.php status`) and the steps to reproduce.
 
 Until a fix is out, you can switch the second factor off under **System > WebAuthn Passkeys > Settings**, or remove the package (see the README).
 
@@ -19,27 +24,39 @@ Until a fix is out, you can switch the second factor off under **System > WebAut
 - **A stolen or guessed GUI password**, used through the Cloudflare Tunnel or from any network that is not marked trusted: without a registered passkey, the session never gets past the passkey page.
 - **Replayed or forged passkey responses**: each challenge is signed with a key only the firewall knows, tied to the session, user and purpose, expires after 5 minutes, and can be used only once.
 - **Cloned authenticators**, as far as their signature counter reveals them.
-- **Tunnel traffic posing as local traffic**: requests from the cloudflared address, or carrying proxy headers, never get the trusted-network exemption.
+- **Tunnel traffic posing as local traffic**: requests from the cloudflared address, carrying proxy headers, or coming from the firewall's own addresses never get the trusted-network exemption.
 - **Password-only XMLRPC** (HA sync, which can run commands as root): refused through a proxy, and while the second factor is on, from everyone except configured peers and trusted networks.
+- **Unlimited passkey attempts**: 5 failures end a session; 10 from one address for one account, over any number of sessions, lock that address out of the account's passkey step for 15 minutes.
 
 ## What it does not protect against
 
 - Anyone on a **trusted network** who has the password. Keep trusted networks narrow.
 - **SSH, the console, VPN** and other services, and packages with their own login.
 - An attacker who can already **run code on the firewall** or change its files.
-- The time between a **pfSense upgrade** and the next cron run (up to one minute), when pfSense has replaced the patched files and the hook is missing.
-- A **future pfSense version** that changes the code the hook attaches to. The hook is then not applied, and a GUI notice says so.
+- A **future pfSense version** that changes the code a hook attaches to. The hook is then not applied and a GUI notice says so (CI checks the hooks weekly against pfSense's development branch to see this coming).
+- The **upgrade window** below.
 
-## Where to look when reviewing
+## The upgrade window, exactly
 
-In order of how much depends on them:
+A pfSense upgrade replaces `/etc/inc/authgui.inc`, `/etc/inc/auth_check.inc` and `/usr/local/www/xmlrpc.php` while the system runs, and then reboots. The package puts its hooks back in two ways:
 
-1. `src/usr/local/pkg/webauthn/webauthn_lib.inc` and `cbor.inc`: verification of registrations and sign-ins (WebAuthn §7.1 and §7.2), the COSE key conversion and the CBOR parser.
-2. `src/usr/local/pkg/webauthn/gate.inc`: the gate that runs after every password check, and the `auth_check.inc` hook.
-3. `src/usr/local/pkg/webauthn/webauthn.inc`: `webauthn_session_status()`, `webauthn_request_source()` and the trusted-network rule; username handling for LDAP/RADIUS.
-4. `src/usr/local/pkg/webauthn/challenge.inc`: challenge format, single use, limits.
-5. `src/usr/local/pkg/webauthn/storage.inc`: credential storage, revocation, counters, locking.
-6. `src/usr/local/pkg/webauthn/hook.inc` and `hook.php`: how pfSense files are patched and kept patched.
-7. `install.sh`: runs as root.
+- **cron, every minute** (`hook.php ensure`), while the system runs;
+- **at boot**, as an early shell command. pfSense's `rc.bootup` runs early shell commands (`system_do_shell_commands(1)`) before it starts the web server (`system_webgui_start()`), so the GUI never accepts a login after a boot without the hooks in place. The package's rc.d script is a second, later safety net.
 
-Run the tests with `sh tests/run_all.sh` (PHP 8.2+ with openssl, sodium, intl and mbstring; as root it also runs the full-disk test).
+The window in which the GUI accepts a password without a passkey therefore opens when the upgrade writes a replaced file, and closes at the next cron minute (at most 60 seconds later) or at the reboot, whichever comes first. A config restore does not open it (it does not touch those files). If the new pfSense version changed the code a hook attaches to, the window stays open until a fixed package version is installed; the notice and `hook.php status` say so.
+
+## Accepted risks
+
+- **Someone with the password, at the same client address as the real user** (for example behind the same NAT), can lock that address out of the account's passkey step for 15 minutes by failing on purpose. Without a lock, there would be no limit on attempts. The user can still sign in from another address or a trusted network.
+- **A damaged file in /conf** (attempt counts, counters, revocation list) stops passkey sign-ins until it is removed: the package fails closed rather than guess. The log names the file; [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) says what to do.
+
+## Findings of the 2026-10-21 review, and what was done
+
+| ID | Severity | Finding | Resolution |
+|---|---|---|---|
+| F1 | Medium | The account-wide failed-attempt lock (then new, unreleased) let anyone with the password keep the real user locked out from anywhere. | Fixed in 1.2.0: the limit is per account **and client address**; the account-wide total only raises a notice. Test: `tests/failure_limit_test.php` ("the right passkey works from another address while the attacker's is locked"). |
+| F2 | Medium | Cloudflare private-network (WARP) traffic forwarded by cloudflared on the firewall arrives from the firewall's own LAN address without proxy headers, and got the trusted-network exemption and XMLRPC access. | Fixed in 1.2.0: loopback and the firewall's own addresses are never a trusted network, and reach XMLRPC only if listed as peers. Tests: `tests/xmlrpc_enrolment_replay_test.php` (F2). |
+| F3 | Low | Registering a removed credential ID under another account lifted the revocation, so a later config restore could bring the removed record back. | Fixed in 1.2.0: revocation is by ID and key and is never lifted. Test: `tests/concurrency_and_config_test.php` (F3). |
+| F4 | Low | A forged login POST with an empty username stripped a session's passkey verification. | Fixed in 1.2.0: a sign-in needs a non-empty username, as in pfSense's `session_auth()`. Test: `tests/xmlrpc_enrolment_replay_test.php` (F4). |
+| F5 | Info | Log lines could carry unfiltered client text (bidi overrides, line separators, unlimited length). | Fixed in 1.2.0: log text goes through `webauthn_plain()`. Test: (F5). |
+| F6 | Info | The cloudflared source had no size limit, so `0.0.0.0/0` would make forged client addresses appear in logs. | Fixed in 1.2.0: same /8 and /16 limit as trusted networks. Test: (F6). |

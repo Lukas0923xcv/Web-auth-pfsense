@@ -1,0 +1,42 @@
+# Static analysis: php phpstan.phar analyse (CI runs it, see .github/workflows/tests.yml)
+parameters:
+	level: 6
+	phpVersion:
+		min: 80200
+		max: 80499
+	fileExtensions:
+		- php
+		- inc
+	paths:
+		- src/usr/local/pkg/webauthn
+		- src/usr/local/www/system_webauthn.php
+	# Declarations of the pfSense functions and classes the package calls.
+	scanFiles:
+		- tools/phpstan/pfsense_stubs.php
+	bootstrapFiles:
+		- tools/phpstan/bootstrap.php
+	# Names for the array shapes the package passes around, used in its docblocks.
+	typeAliases:
+		# installedpackages/webauthn/config/0, see webauthn_default_settings()
+		WebAuthnSettings: 'array<string, string>'
+		# see webauthn_request_source()
+		WebAuthnSource: 'array{peer: string, client: string, via_proxy: bool, proxy_headers: bool, from_firewall?: bool}'
+		# $_SESSION
+		WebAuthnSession: 'array<string, mixed>'
+		# a passkey record from installedpackages/webauthn/item
+		WebAuthnCredential: 'array<string, mixed>'
+	ignoreErrors:
+		-
+			# pfSense's own logo, only present on the firewall.
+			identifier: include.fileNotFound
+			path: src/usr/local/pkg/webauthn/gate.inc
+			message: '#"/usr/local/www/logo\.svg"#'
+			count: 1
+		-
+			# get_configured_ip*_addresses() are declared in the stubs (they exist on
+			# pfSense) but pfsense-utils.inc is not loaded on every path, so the
+			# function_exists() check is needed at run time.
+			identifier: function.alreadyNarrowedType
+			path: src/usr/local/pkg/webauthn/webauthn.inc
+			message: '#function_exists\(\) with .get_configured_ip#'
+			count: 1

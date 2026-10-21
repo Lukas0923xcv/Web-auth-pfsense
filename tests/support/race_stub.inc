@@ -6,6 +6,7 @@
  */
 $D = getenv('WEBAUTHN_RACE_DIR');
 define('WEBAUTHN_COUNTER_FILE', "$D/count.json");
+define('WEBAUTHN_FAILURE_FILE', "$D/failures.json");
 define('WEBAUTHN_KEY_FILE', "$D/key");
 define('WEBAUTHN_USED_FILE', "$D/used.json");
 define('WEBAUTHN_REVOKED_FILE', "$D/revoked.json");
@@ -53,4 +54,4 @@ if (!function_exists('gettext')) {
 	function gettext($s) { return $s; }
 }
 require_once(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/gate.inc');
-require_once(dirname(__DIR__) . '/helpers.inc');
+require_once(__DIR__ . '/helpers.inc');

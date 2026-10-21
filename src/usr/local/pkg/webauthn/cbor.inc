@@ -13,11 +13,14 @@
 
 class WebAuthnCborException extends Exception {}
 
-/*
+/**
  * Decode one CBOR item from $data starting at $offset.
  * Returns the decoded value; $offset is advanced past the item.
  * Byte strings are returned as WebAuthnCborBytes so they can be told
  * apart from text strings.
+ * Long: one switch over the eight CBOR major types, each a few lines;
+ * spreading it over functions would hide the format's structure.
+ * @return mixed
  */
 function webauthn_cbor_decode_item(string $data, int &$offset, int $depth = 0) {
 	if ($depth > 16) {
@@ -33,7 +36,7 @@ function webauthn_cbor_decode_item(string $data, int &$offset, int $depth = 0) {
 
 	if ($info < 24) {
 		$arg = $info;
-	} elseif ($info >= 24 && $info <= 27) {
+	} elseif ($info <= 27) {
 		$n = 1 << ($info - 24);
 		if ($offset + $n > $len) {
 			throw new WebAuthnCborException('CBOR truncated');
@@ -86,7 +89,8 @@ function webauthn_cbor_decode_item(string $data, int &$offset, int $depth = 0) {
 	case 6:
 		/* Tag: ignore the tag number and return the tagged item. */
 		return webauthn_cbor_decode_item($data, $offset, $depth + 1);
-	case 7:
+	default:
+		/* Major type 7: simple values. */
 		switch ($info) {
 		case 20:
 			return false;
@@ -98,7 +102,6 @@ function webauthn_cbor_decode_item(string $data, int &$offset, int $depth = 0) {
 		}
 		throw new WebAuthnCborException('CBOR floats/simple values not supported');
 	}
-	throw new WebAuthnCborException('CBOR invalid major type');
 }
 
 /*
@@ -110,13 +113,17 @@ function webauthn_cbor_decode_item(string $data, int &$offset, int $depth = 0) {
 define('WEBAUTHN_CBOR_TEXT_KEY_PREFIX', "\0text:");
 
 function webauthn_cbor_map_key(int|string $k): int|string {
-	if (is_string($k) && is_int(array_key_first([$k => true]))) {
+	/* PHP's rule: a decimal integer string in canonical form becomes an int key. */
+	if (is_string($k) && (string)(int)$k === $k) {
 		return WEBAUTHN_CBOR_TEXT_KEY_PREFIX . $k;
 	}
 	return $k;
 }
 
-/* Decode a buffer that must contain exactly one CBOR item. */
+/**
+ * Decode a buffer that must contain exactly one CBOR item.
+ * @return mixed
+ */
 function webauthn_cbor_decode(string $data) {
 	$offset = 0;
 	$value = webauthn_cbor_decode_item($data, $offset);

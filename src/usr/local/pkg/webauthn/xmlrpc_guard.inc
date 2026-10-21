@@ -20,6 +20,10 @@
 
 require_once(__DIR__ . '/webauthn.inc');
 
+/**
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
+ */
 function webauthn_xmlrpc_refused(array $source, array $settings): bool {
 	if ($source['via_proxy'] || $source['proxy_headers']) {
 		return true;
@@ -27,7 +31,12 @@ function webauthn_xmlrpc_refused(array $source, array $settings): bool {
 	if (empty($settings['enable'])) {
 		return false;
 	}
-	$allowed = array_merge(webauthn_split_list($settings['xmlrpc_peers'] ?? ''), webauthn_split_list($settings['trusted_networks'] ?? ''));
+	/* A trusted network does not admit the firewall's own addresses (see
+	 * webauthn_is_firewall_address()); an XMLRPC peer listed explicitly does. */
+	$allowed = webauthn_split_list($settings['xmlrpc_peers'] ?? '');
+	if (empty($source['from_firewall'])) {
+		$allowed = array_merge($allowed, webauthn_split_list($settings['trusted_networks'] ?? ''));
+	}
 	return $source['peer'] === '' || !webauthn_ip_in_list($source['peer'], $allowed);
 }
 

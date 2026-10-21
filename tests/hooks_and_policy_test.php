@@ -1,12 +1,14 @@
 <?php
 /*
- * Regression tests for the security audit findings F1-F7:
- *   php tests/audit_test.php
+ * Hooks, cached privileges, username variants, trusted networks, CBOR
+ * keys and revocation (security audit findings F1-F7):
+ *   php tests/hooks_and_policy_test.php
  * (F0 and D1 are covered by decision-level checks at the end.)
  */
 
 $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-audit-count.json");
+define('WEBAUTHN_FAILURE_FILE', "$tmp/webauthn-audit-failures.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-audit.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-audit-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-audit-revoked.json");
@@ -39,7 +41,7 @@ function config_set_path($path, $value) {
 	$c = $value;
 }
 function write_config($desc) { return $GLOBALS['test_config']; }
-/* The in-memory config is the one on disk (see tests/review4 for the snapshot case). */
+/* The in-memory config is the one on disk (see tests/storage_and_sessions_test.php for the snapshot case). */
 function config_read_file(bool $use_backup = false, bool $use_cache = true): bool { return true; }
 if (!function_exists('gettext')) {
 	function gettext($s) { return $s; }
@@ -50,7 +52,7 @@ $pkg = "$repo/src/usr/local/pkg/webauthn";
 require_once("$pkg/webauthn.inc");
 require_once("$pkg/hook.inc");
 require_once("$pkg/xmlrpc_guard.inc");
-require_once(__DIR__ . '/helpers.inc');
+require_once(__DIR__ . '/support/helpers.inc');
 
 $failures = 0;
 $count = 0;
@@ -274,7 +276,7 @@ check($threw, 'F6: COSE key with a text "1" label is rejected');
 
 $state = tempnam($tmp, 'webauthn-audit-gate');
 function gate_req(string $state, array $r): array {
-	$out = shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(__DIR__ . '/gate_step.php') . ' ' .
+	$out = shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(__DIR__ . '/support/gate_step.php') . ' ' .
 	    escapeshellarg($state) . ' ' . escapeshellarg(json_encode($r)));
 	preg_match('/@@RESULT (.*)$/m', (string)$out, $mm);
 	return json_decode($mm[1] ?? 'null', true) ?? [];

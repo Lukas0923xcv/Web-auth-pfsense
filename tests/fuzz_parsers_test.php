@@ -1,9 +1,9 @@
 <?php
 /* Mutation fuzz of the CBOR / authenticator-data / COSE parsers. Any
  * exception other than WebAuthn(Cbor)Exception, or any PHP warning, is
- * reported. php tests/review3/fuzz_parsers.php [iterations] */
-require_once(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/webauthn_lib.inc');
-require_once(dirname(__DIR__) . '/helpers.inc');
+ * reported. php tests/fuzz_parsers_test.php [iterations] */
+require_once(dirname(__DIR__) . '/src/usr/local/pkg/webauthn/webauthn_lib.inc');
+require_once(__DIR__ . '/support/helpers.inc');
 set_error_handler(function ($no, $str, $file, $line) { throw new ErrorException($str, 0, $no, $file, $line); });
 $n = (int)($argv[1] ?? 20000);
 $rp = 'example.com';

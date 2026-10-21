@@ -1,10 +1,10 @@
 <?php
 /*
- * End-to-end gate checks for the fourth review, through tests/gate_step.php:
- *   php tests/review4/gate_review4.php
+ * End-to-end gate checks of session binding, through tests/support/gate_step.php:
+ *   php tests/gate_session_test.php
  */
-require_once(dirname(__DIR__) . '/helpers.inc');
-require_once(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/webauthn_lib.inc');
+require_once(__DIR__ . '/support/helpers.inc');
+require_once(dirname(__DIR__) . '/src/usr/local/pkg/webauthn/webauthn_lib.inc');
 $rp = 'pfsense.example.com';
 $settings = ['enable' => 'yes', 'rp_id' => $rp, 'origins' => "https://$rp", 'trusted_proxies' => '192.168.1.5',
     'trusted_networks' => '', 'user_verification' => 'preferred', 'enforce' => ''];
@@ -22,7 +22,7 @@ function check($cond, $name) {
 	}
 }
 function req(string $state, array $r): array {
-	$out = (string)shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(dirname(__DIR__) . '/gate_step.php') . ' ' .
+	$out = (string)shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(__DIR__ . '/support/gate_step.php') . ' ' .
 	    escapeshellarg($state) . ' ' . escapeshellarg(json_encode($r)));
 	preg_match('/@@RESULT (.*)$/m', $out, $m);
 	return (json_decode($m[1] ?? 'null', true) ?? []) + ['html' => $out];

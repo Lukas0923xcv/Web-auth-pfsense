@@ -1,9 +1,9 @@
 <?php
 /*
- * End-to-end tests of webauthn_gate(): php tests/gate_test.php
+ * End-to-end tests of webauthn_gate(): php tests/gate_flow_test.php
  * Each request runs in its own process because the gate exits.
  */
-require_once(__DIR__ . '/helpers.inc');
+require_once(__DIR__ . '/support/helpers.inc');
 require_once(dirname(__DIR__) . '/src/usr/local/pkg/webauthn/webauthn_lib.inc');
 
 $failures = 0;
@@ -39,7 +39,7 @@ function setup(string $state, array $settings): void {
 }
 
 function req(string $state, array $r): array {
-	$out = shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(__DIR__ . '/gate_step.php') . ' ' .
+	$out = shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(__DIR__ . '/support/gate_step.php') . ' ' .
 	    escapeshellarg($state) . ' ' . escapeshellarg(json_encode($r)));
 	preg_match('/@@RESULT (.*)$/m', $out, $m);
 	$res = json_decode($m[1] ?? 'null', true) ?? [];

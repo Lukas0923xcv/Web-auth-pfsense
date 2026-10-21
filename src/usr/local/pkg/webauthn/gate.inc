@@ -32,7 +32,6 @@ function webauthn_gate(): void {
 	}
 	$typed = webauthn_normalize_username($_SESSION['Username'] ?? '');
 	$user = webauthn_session_identity($_SESSION);
-	$state = $_SESSION['webauthn'] ?? null;
 	$source = webauthn_request_source($_SERVER, $settings);
 	$decision = webauthn_session_status($settings, $_SESSION, $source);
 
@@ -45,9 +44,7 @@ function webauthn_gate(): void {
 		/* A local sign-in name that matches no account: fail closed. */
 		webauthn_log(LOG_WARNING, "user '{$typed}' does not resolve to a local account; access refused", $source);
 		unset($_SESSION['webauthn'], $_SESSION['page-match']);
-		phpsession_end(true);
-		webauthn_render_gate_page('deny', $settings, null, '');
-		exit;
+		webauthn_gate_refuse('deny', $settings);
 	}
 	if ($user !== $typed) {
 		webauthn_log(LOG_WARNING, "sign-in name '{$typed}' resolves to local account '{$user}'; its passkeys apply", $source);
@@ -59,15 +56,7 @@ function webauthn_gate(): void {
 	}
 
 	if ($decision == 'skip') {
-		$method = webauthn_source_is_trusted_network($source, $settings) ? 'trusted-network' : 'no-credential';
-		if (!is_array($state) || ($state['user'] ?? null) !== $user || ($state['method'] ?? null) !== $method) {
-			$_SESSION['webauthn'] = ['user' => $user, 'method' => $method];
-			webauthn_log(LOG_NOTICE, "user '{$user}' skipped WebAuthn (" .
-			    ($method == 'trusted-network' ? 'trusted network' : 'no registered passkey and enforcement off') . ")", $source);
-			phpsession_end(true);
-		} else {
-			phpsession_end($changed);
-		}
+		webauthn_gate_skip($user, $source, $settings, $changed);
 		return;
 	}
 
@@ -92,51 +81,115 @@ function webauthn_gate(): void {
 		webauthn_gate_logout();
 	}
 
-	$error = '';
+	webauthn_gate_refuse_unusable($user, $decision, $settings, $source);
+	$error = ($action == 'assert') ? webauthn_gate_assert($user, $settings, $source) : '';
+	webauthn_gate_challenge($user, $settings, $error);
+}
+
+/**
+ * Refuse a session that must pass the passkey step but cannot: no passkey
+ * while enforced, passkeys only under another spelling of the name, or the
+ * account locked after too many failed attempts. Session must be open.
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
+ */
+function webauthn_gate_refuse_unusable(string $user, string $decision, array $settings, array $source): void {
 	if ($decision == 'deny') {
 		webauthn_log(LOG_WARNING, "user '{$user}' has no registered passkey and enforcement is on; access refused", $source);
-		phpsession_end(true);
-		webauthn_render_gate_page('deny', $settings, null, '');
-		exit;
+		webauthn_gate_refuse('deny', $settings);
 	}
-
 	if (empty(webauthn_get_credentials($user))) {
 		/* Only another spelling of this LDAP/RADIUS username (case,
 		 * "@domain", ...) has passkeys. They belong to that exact name. */
 		webauthn_log(LOG_WARNING, "user '{$user}' has no passkey, but another spelling of the username does; access refused", $source);
+		webauthn_gate_refuse('case', $settings);
+	}
+	if (webauthn_failure_lock_remaining($user, $source['client']) > 0) {
+		webauthn_log(LOG_WARNING, "user '{$user}' is locked out of the passkey step from this address after too many failed attempts", $source);
+		webauthn_gate_refuse('locked', $settings);
+	}
+}
+
+/**
+ * End the request with a page that offers only "Sign out" ($mode: deny, case or locked). Session must be open.
+ * @param WebAuthnSettings $settings
+ */
+function webauthn_gate_refuse(string $mode, array $settings): never {
+	phpsession_end(true);
+	webauthn_render_gate_page($mode, $settings, null, '');
+	exit;
+}
+
+/**
+ * Let a session that is exempt from the passkey step through, recording why once. Session must be open.
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
+ */
+function webauthn_gate_skip(string $user, array $source, array $settings, bool $changed): void {
+	$method = webauthn_source_is_trusted_network($source, $settings) ? 'trusted-network' : 'no-credential';
+	$state = $_SESSION['webauthn'] ?? null;
+	if (!is_array($state) || ($state['user'] ?? null) !== $user || ($state['method'] ?? null) !== $method) {
+		$_SESSION['webauthn'] = ['user' => $user, 'method' => $method];
+		webauthn_log(LOG_NOTICE, "user '{$user}' skipped WebAuthn (" .
+		    ($method == 'trusted-network' ? 'trusted network' : 'no registered passkey and enforcement off') . ")", $source);
+		$changed = true;
+	}
+	phpsession_end($changed);
+}
+
+/**
+ * Handle a submitted assertion. On success the session is marked verified
+ * and the browser redirected (no return). On failure returns the message
+ * for the challenge page, or ends the session after too many failures in
+ * it. The attempt is counted for the account and client address before
+ * it is verified (see webauthn_failure_begin()), so no number of new
+ * sessions can try more than WEBAUTHN_MAX_USER_FAILURES passkeys from one
+ * address in WEBAUTHN_FAILURE_WINDOW.
+ * Session must be open.
+ * @param WebAuthnSettings $settings
+ * @param WebAuthnSource $source
+ */
+function webauthn_gate_assert(string $user, array $settings, array $source): string {
+	if (!webauthn_failure_begin($user, $source['client'])) {
+		webauthn_log(LOG_WARNING, "passkey attempt for user '{$user}' refused: too many failed attempts, or the attempt could not be recorded", $source);
+		webauthn_gate_refuse('locked', $settings);
+	}
+	$result = webauthn_gate_check_assertion($user, $settings);
+	if (is_array($result)) {
+		webauthn_failure_clear($user, $source['client']);
+		session_regenerate_id(true);
+		$_SESSION['webauthn'] = webauthn_verified_state($user, $result, !empty($result['uv']), $settings);
+		unset($_SESSION['webauthn_failures']);
+		webauthn_log(LOG_NOTICE, "user '{$user}' verified with passkey", $source);
 		phpsession_end(true);
-		webauthn_render_gate_page('case', $settings, null, '');
+		header('Location: ' . webauthn_safe_redirect($_SERVER['REQUEST_URI'] ?? '/'));
 		exit;
 	}
-
-	if ($action == 'assert') {
-		$result = webauthn_gate_check_assertion($user, $settings);
-		if (is_array($result)) {
-			session_regenerate_id(true);
-			$_SESSION['webauthn'] = webauthn_verified_state($user, $result, !empty($result['uv']), $settings);
-			unset($_SESSION['webauthn_failures']);
-			webauthn_log(LOG_NOTICE, "user '{$user}' verified with passkey", $source);
-			phpsession_end(true);
-			header('Location: ' . webauthn_safe_redirect($_SERVER['REQUEST_URI'] ?? '/'));
-			exit;
-		}
-		$failures = (int)($_SESSION['webauthn_failures'] ?? 0) + 1;
-		$_SESSION['webauthn_failures'] = $failures;
-		webauthn_log(LOG_WARNING, "passkey verification failed for user '{$user}' ({$failures}/" . WEBAUTHN_MAX_FAILURES . "): {$result}", $source);
-		if ($failures >= WEBAUTHN_MAX_FAILURES) {
-			webauthn_log(LOG_WARNING, "too many passkey failures for user '{$user}'; session ended", $source);
-			webauthn_notice(sprintf('%d failed passkey attempts for user "%s" from %s after a correct password. ' .
-			    'If this was not you, change the password.', $failures, webauthn_plain($user), $source['client']), 'failures:' . $user);
-			webauthn_gate_logout();
-		}
-		$error = gettext('Passkey verification failed. Try again.');
+	$failures = (int)($_SESSION['webauthn_failures'] ?? 0) + 1;
+	$_SESSION['webauthn_failures'] = $failures;
+	webauthn_log(LOG_WARNING, "passkey verification failed for user '{$user}' ({$failures}/" . WEBAUTHN_MAX_FAILURES . "): {$result}", $source);
+	$locked = webauthn_failure_lock_remaining($user, $source['client']) > 0;
+	$total = webauthn_failure_account_total($user);
+	if ($failures >= WEBAUTHN_MAX_FAILURES || $locked || $total >= WEBAUTHN_MAX_USER_FAILURES) {
+		webauthn_notice(sprintf('%d failed passkey attempts for user "%s" (last from %s) after a correct password. ' .
+		    'If this was not you, change the password.', max($failures, $total), webauthn_plain($user), $source['client']), 'failures:' . $user);
 	}
+	if ($failures >= WEBAUTHN_MAX_FAILURES || $locked) {
+		webauthn_log(LOG_WARNING, "too many passkey failures for user '{$user}'; session ended" .
+		    ($locked ? ', this address is locked out of the passkey step for ' . intdiv(WEBAUTHN_FAILURE_WINDOW, 60) . ' minutes' : ''), $source);
+		webauthn_gate_logout();
+	}
+	return gettext('Passkey verification failed. Try again.');
+}
 
-	/*
-	 * The browser checks that it is on an allowed origin before starting
-	 * the ceremony. The Host header pfSense receives cannot be used for
-	 * that: cloudflared may rewrite it to the origin service address.
-	 */
+/**
+ * Show the passkey page with a new challenge. The browser checks that it
+ * is on an allowed origin before starting the ceremony. The Host header
+ * pfSense receives cannot be used for that: cloudflared may rewrite it to
+ * the origin service address. Session must be open.
+ * @param WebAuthnSettings $settings
+ */
+function webauthn_gate_challenge(string $user, array $settings, string $error): never {
 	$options = [
 		'challenge' => webauthn_b64url_encode(webauthn_new_challenge('login', $user)),
 		'rpId' => webauthn_rp_id($settings),
@@ -152,10 +205,12 @@ function webauthn_gate(): void {
 	exit;
 }
 
-/*
+/**
  * Returns the verified credential (with 'uv' => bool) on success, or an
  * error string. Session must be open. The challenge counts as used only
  * if the whole check succeeds (see webauthn_use_challenge()).
+ * @param WebAuthnSettings $settings
+ * @return WebAuthnCredential|string
  */
 function webauthn_gate_check_assertion(string $user, array $settings) {
 	try {
@@ -187,7 +242,7 @@ function webauthn_gate_check_assertion(string $user, array $settings) {
 }
 
 /* End the session entirely and send the browser to the login form. */
-function webauthn_gate_logout(): void {
+function webauthn_gate_logout(): never {
 	$_SESSION = [];
 	if (isset($_COOKIE[session_name()])) {
 		setcookie(session_name(), '', time() - 42000, '/');
@@ -206,6 +261,14 @@ function webauthn_safe_redirect(string $uri): string {
 	return $uri;
 }
 
+/**
+ * The passkey page shown in place of the GUI ($mode: challenge, deny,
+ * case or locked), styled like pfSense's login page.
+ * Long: it is one HTML template; split up, the page would no longer read
+ * top to bottom.
+ * @param array<string, mixed>|null $options
+ * @param WebAuthnSettings $settings
+ */
 function webauthn_render_gate_page(string $mode, array $settings, ?array $options, string $error): void {
 	$origins = webauthn_allowed_origins($settings);
 	$logincss = '#1e3f75';
@@ -269,6 +332,10 @@ function webauthn_render_gate_page(string $mode, array $settings, ?array $option
 <?php endforeach; ?>
 								</ul>
 							</div>
+<?php elseif ($mode == 'locked'): ?>
+							<input type="hidden" name="webauthn_action" value="cancel" />
+							<p style="color:#fff"><?=sprintf(gettext('Too many failed passkey attempts for this account from your address. Try again in %d minutes, or sign in from a trusted network.'),
+								intdiv(WEBAUTHN_FAILURE_WINDOW + 59, 60))?></p>
 <?php elseif ($mode == 'case'): ?>
 							<input type="hidden" name="webauthn_action" value="cancel" />
 							<p style="color:#fff"><?=gettext('The passkeys for this account are registered under another spelling of the username (for example different capitals or without a @domain suffix). Sign out, then sign in with the username exactly as it was registered.')?></p>

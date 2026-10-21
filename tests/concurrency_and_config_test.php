@@ -1,7 +1,9 @@
 <?php
 /*
- * Regression tests for the independent review of the fourth-review state
- * (REVIEW4.md, findings R4-I to R4-N): php tests/review4/review4b_test.php
+ * Parallel removals, LDAP names, the per-account challenge limit,
+ * revocation under the config lock and outside config changes (findings
+ * R4-I to R4-N, kept in the git history):
+ *   php tests/concurrency_and_config_test.php
  */
 $dir = sys_get_temp_dir() . '/webauthn-r4b-' . getmypid();
 @mkdir($dir);
@@ -12,7 +14,7 @@ function reset_dir(string $dir): void {
 	}
 }
 reset_dir($dir);
-require __DIR__ . '/race_stub.inc';
+require __DIR__ . '/support/race_stub.inc';
 
 $failures = 0;
 $count = 0;
@@ -54,7 +56,7 @@ for ($run = 0; $run < 5; $run++) {
 	reset_dir($dir);
 	setup_disk($settings, [rec('bob', 'IDA', $rp, ['uid' => '2000']), rec('bob', 'IDB', $rp, ['uid' => '2000'])]);
 	$start = microtime(true) + 0.3;
-	$cmd = PHP_BINARY . ' ' . escapeshellarg(__DIR__ . '/race_delete.php');
+	$cmd = PHP_BINARY . ' ' . escapeshellarg(__DIR__ . '/support/race_delete.php');
 	$p1 = popen("$cmd IDA $start", 'r');
 	$p2 = popen("$cmd IDB $start", 'r');
 	$out = stream_get_contents($p1) . stream_get_contents($p2);
@@ -86,7 +88,7 @@ check(!webauthn_registrable_name(['Username' => 'x/carol'] + $ldap) && !webauthn
     !webauthn_registrable_name(['Username' => 'x/carol', 'authsource' => 'RADIUS/r']), 'R4-J ...nor "\\" or "/" names through LDAP or RADIUS');
 check(webauthn_registrable_name(['Username' => 'carol@realm', 'authsource' => 'RADIUS/r']), 'R4-J RADIUS user@realm names can');
 setup_disk($settings, [], ['system' => ['authserver' => [['name' => 'corp', 'type' => 'ldap', 'ldap_nostrip_at' => '']]]]);
-check(webauthn_ldap_account(['Username' => 'alice@corp'] + $ldap) === 'alice@corp', 'R4-J ldap_nostrip_at respected');
+check(webauthn_session_identity(['Username' => 'alice@corp'] + $ldap) === 'alice@corp', 'R4-J with ldap_nostrip_at the passkey owner is the whole "@" name');
 /* N2: with ldap_nostrip_at, "@" names can register. */
 check(webauthn_registrable_name(['Username' => 'carol@corp.com'] + $ldap), 'N2 nostrip: "carol@corp.com" can register');
 check(webauthn_add_credential('carol@corp.com', 'k', make_reg($rp), $rp) === null, 'N2 setup: registered');
@@ -141,7 +143,7 @@ try {
 check(webauthn_use_challenge('register', 'bob', $cdj, function ($ch) { return 'fresh'; }) === 'fresh',
     'R4-K a ceremony that fails inside the check does not use up its challenge');
 /* N1: the page saves the passkey after the challenge check, not while holding the lock every sign-in needs. */
-$page = file_get_contents(dirname(__DIR__, 2) . '/src/usr/local/www/system_webauthn.php');
+$page = file_get_contents(dirname(__DIR__) . '/src/usr/local/www/system_webauthn.php');
 $use = strpos($page, "webauthn_use_challenge('register'");
 $end = strpos($page, '});', $use);
 $add = strpos($page, 'webauthn_add_credential(', $use);
@@ -161,11 +163,29 @@ for ($i = 0; $i < WEBAUTHN_MAX_CREDENTIALS_PER_USER; $i++) {
 setup_disk($settings, $orphans);
 check(webauthn_add_credential('bob', 'new', make_reg($rp), $rp, '2000') === null, 'R4-K passkeys of a deleted account do not count towards the limit');
 
-/* ---- R4-L: revocation lifted and set under the same lock ---- */
-$src = file_get_contents(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/storage.inc');
-$add = substr($src, strpos($src, 'function webauthn_add_credential'), 4000);
-check(preg_match('/,\s*function \(\) use \(\$id, &\$error\) \{.*?webauthn_unrevoke\(\$id\)/s', $add) === 1,
-    'R4-L the revocation is lifted in the after-save step, inside the config lock');
+/*
+ * ---- R4-L and review F3: a removed passkey never comes back ----
+ * Revocation used to be by ID, and registering the ID again lifted it,
+ * which let another account bring a removed record back through a config
+ * restore. It is now by ID and key, and nothing lifts it.
+ */
+setup_disk($settings, []);
+$victim = make_reg($rp);
+check(webauthn_add_credential('bob', 'v', $victim, $rp, '2000') === null, 'F3 setup: victim passkey registered');
+$vid = webauthn_b64url_encode($victim['credential_id']);
+$old = $GLOBALS['test_config']['installedpackages']['webauthn']['item'];
+check(webauthn_delete_credential($vid, null), 'F3 setup: an admin removes it');
+check(webauthn_add_credential('mallory', 'm', make_reg($rp, $victim['credential_id']), $rp) === null,
+    'F3 the same ID with another key can be registered, by any account');
+$GLOBALS['test_config']['installedpackages']['webauthn']['item'][] = $old[0];   /* a config restore brings the old record back */
+check(webauthn_find_credential('bob', $vid) === null, 'F3 ...but the removed record stays revoked after the restore');
+check(webauthn_find_credential('mallory', $vid) !== null, 'F3 ...while the new record (other key) works');
+check(webauthn_add_credential('bob', 'again', $victim, $rp, '2000') === 'This passkey was removed earlier and cannot be registered again.',
+    'F3 the removed key itself cannot be registered again');
+file_put_contents(WEBAUTHN_REVOKED_FILE, json_encode([$vid => time()]));             /* whole-ID revocation of an older version */
+check(webauthn_find_credential('mallory', $vid) === null &&
+    webauthn_add_credential('carol', 'c', make_reg($rp, $victim['credential_id']), $rp) !== null,
+    'F3 a whole-ID revocation (older versions) revokes every key and blocks the ID');
 
 /* ---- R4-M: changes made outside the WebAuthn page are reported ---- */
 reset_dir($dir);
@@ -211,7 +231,7 @@ for ($i = 0; $i < 10; $i++) {
 @rmdir(WEBAUTHN_NOTICE_FILE . '.' . getmypid() . '.tmp');
 check(substr_count((string)@file_get_contents("$dir/notices.log"), 'changed outside') === 1, 'C2 full /conf: one notice in 10 requests');
 check($GLOBALS['parses'] === 1, "C2 full /conf: config.xml parsed once, not on every request ({$GLOBALS['parses']})");
-$gate = file_get_contents(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/gate.inc');
+$gate = file_get_contents(dirname(__DIR__) . '/src/usr/local/pkg/webauthn/gate.inc');
 check(strpos($gate, 'webauthn_check_config_state();') < strpos($gate, "if (empty(\$settings['enable']))"),
     'R4-M the gate checks before it looks at the enable setting');
 

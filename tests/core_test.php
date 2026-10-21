@@ -1,6 +1,6 @@
 <?php
 /*
- * Off-box tests: php tests/run.php
+ * Off-box tests: php tests/core_test.php
  * Stubs the few pfSense functions the package uses.
  */
 
@@ -26,12 +26,13 @@ function config_set_path($path, $value) {
 	$c = $value;
 }
 function write_config($desc) { return $GLOBALS['test_config']; }
-/* The in-memory config is the one on disk (see tests/review4 for the snapshot case). */
+/* The in-memory config is the one on disk (see tests/storage_and_sessions_test.php for the snapshot case). */
 function config_read_file(bool $use_backup = false, bool $use_cache = true): bool { return true; }
 if (!function_exists("gettext")) { function gettext($s) { return $s; } }
 
 $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-test-count.json");
+define('WEBAUTHN_FAILURE_FILE', "$tmp/webauthn-test-failures.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-test.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-test-used.json");
 define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-test-revoked.json");
@@ -66,7 +67,7 @@ function throws(callable $f, $name, $needle = '') {
 	}
 }
 
-require_once(__DIR__ . '/helpers.inc');
+require_once(__DIR__ . '/support/helpers.inc');
 
 /* ---- CBOR ---- */
 check(webauthn_cbor_decode("\x18\x64") === 100, 'cbor uint');
@@ -235,7 +236,7 @@ $one = ['username' => 'admin', 'name' => 'Proton Pass', 'id' => 'abc', 'alg' => 
 config_set_path(WEBAUTHN_CRED_PATH, $one);
 check(count(webauthn_get_credentials('admin')) === 1, 'lone <credential> element read as one passkey');
 check(webauthn_delete_credential('abc', 'admin') && count(webauthn_get_credentials()) === 0, 'lone credential deletable');
-/* "abc" was removed above and is now revoked: a record brought back with that ID stays ignored (see tests/review4). */
+/* "abc" was removed above and is now revoked: a record brought back with that ID stays ignored (see tests/storage_and_sessions_test.php). */
 config_set_path(WEBAUTHN_CRED_PATH, [array_merge($one, ['id' => 'ghi']), array_merge($one, ['id' => 'def', 'username' => 'bob'])]);
 check(count(webauthn_get_credentials()) === 2 && count(webauthn_get_credentials('bob')) === 1, 'credential list read');
 config_set_path(WEBAUTHN_CRED_PATH, '');

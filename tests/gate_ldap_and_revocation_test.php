@@ -1,12 +1,12 @@
 <?php
 /*
- * End-to-end gate checks for the third review, through tests/gate_step.php:
- *   php tests/review3/gate_ldap_variant.php
+ * End-to-end gate checks, through tests/support/gate_step.php:
+ *   php tests/gate_ldap_and_revocation_test.php
  * R1: an LDAP spelling of a username with passkeys must not pass the gate.
  * R2: a session whose (last) passkey was removed is signed out.
  */
-require_once(dirname(__DIR__) . '/helpers.inc');
-require_once(dirname(__DIR__, 2) . '/src/usr/local/pkg/webauthn/webauthn_lib.inc');
+require_once(__DIR__ . '/support/helpers.inc');
+require_once(dirname(__DIR__) . '/src/usr/local/pkg/webauthn/webauthn_lib.inc');
 $rp = 'pfsense.example.com';
 $settings = ['enable' => 'yes', 'rp_id' => $rp, 'origins' => "https://$rp", 'trusted_proxies' => '192.168.1.5',
     'trusted_networks' => '', 'user_verification' => 'preferred', 'enforce' => ''];
@@ -31,7 +31,7 @@ function check($cond, $name) {
 function gate(array $config, array $session, array $server): array {
 	$state = tempnam(sys_get_temp_dir(), 'r3gate');
 	file_put_contents($state, serialize(['config' => $config, 'session' => $session]));
-	$out = (string)shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(dirname(__DIR__) . '/gate_step.php') . ' ' .
+	$out = (string)shell_exec(PHP_BINARY . ' -d error_reporting=0 ' . escapeshellarg(__DIR__ . '/support/gate_step.php') . ' ' .
 	    escapeshellarg($state) . ' ' . escapeshellarg(json_encode(['server' => $server])));
 	unlink($state);
 	preg_match('/@@RESULT (.*)$/m', $out, $m);

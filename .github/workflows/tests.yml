@@ -3,6 +3,9 @@ name: tests
 on:
   push:
   pull_request:
+  schedule:
+    # Weekly, to notice when pfSense's master drifts from the hook anchors.
+    - cron: '17 5 * * 1'
 
 permissions:
   contents: read
@@ -22,7 +25,69 @@ jobs:
         with:
           php-version: ${{ matrix.php }}
           extensions: openssl, sodium, intl, mbstring
+          coverage: pcov
+      - name: Run all tests, with coverage, shellcheck and the install/uninstall test
+        # As root: the full-disk test mounts a tmpfs, and the install/uninstall
+        # test writes /etc/inc and /usr/local like on pfSense (this runner is
+        # thrown away afterwards).
+        run: |
+          sudo env PATH="$PATH" PHP="$(command -v php)" COVERAGE=1 REQUIRE_SHELLCHECK=1 \
+            WEBAUTHN_SYSTEM_TEST=1 GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" sh tests/run_all.sh
+
+  phpstan:
+    name: PHPStan (level 6)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # 2.37.0
+        with:
+          php-version: '8.3'
+          extensions: openssl, sodium, intl, mbstring
           coverage: none
-      - name: Run all tests
-        # As root, so the full-disk test can mount its tmpfs.
-        run: sudo env PATH="$PATH" PHP="$(command -v php)" sh tests/run_all.sh
+      - name: Download PHPStan 2.1.50 and check its checksum
+        run: |
+          curl -fsSL --retry 3 -o /tmp/phpstan.phar https://github.com/phpstan/phpstan/releases/download/2.1.50/phpstan.phar
+          echo "335dba3aff82ad2d7ddcc7ce5908aaffe0e83b1d7ad0e81683beef24a4696f34  /tmp/phpstan.phar" | sha256sum -c -
+      - name: Analyse
+        run: php /tmp/phpstan.phar analyse --no-progress --error-format=github
+
+  readme-pin:
+    name: README install command
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: 0
+      - name: The pinned commit exists and its tarball has the checksum the command checks
+        run: sh tools/check_pin.sh
+
+  pfsense-release:
+    name: Hooks apply to pfSense CE 2.8.1
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # 2.37.0
+        with:
+          php-version: '8.3'
+          coverage: none
+      - name: Check the hooks against the files of the 2.8.1 release (fails on a break)
+        run: sh tools/upstream_anchors.sh release
+
+  pfsense-master:
+    name: Hooks apply to pfSense master
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # 2.37.0
+        with:
+          php-version: '8.3'
+          coverage: none
+      - name: Check the hooks against pfsense/pfsense master (warns on drift)
+        run: |
+          if sh tools/upstream_anchors.sh master; then
+            echo "Hooks apply to pfSense master." >> "$GITHUB_STEP_SUMMARY"
+          else
+            msg="pfSense master changed the code a hook is anchored to: the next pfSense release may need a new anchor (hook.inc)."
+            echo "::warning title=pfSense master drift::$msg"
+            echo "**Warning:** $msg" >> "$GITHUB_STEP_SUMMARY"
+          fi

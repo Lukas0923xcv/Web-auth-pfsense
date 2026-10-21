@@ -15,7 +15,8 @@
 ##|-PRIV
 
 require_once("guiconfig.inc");
-require_once("/usr/local/pkg/webauthn/webauthn.inc");
+/* The package files sit next to the web root: /usr/local/www/../pkg/webauthn. */
+require_once(__DIR__ . "/../pkg/webauthn/webauthn.inc");
 
 phpsession_begin();
 /* The account passkeys belong to ('' for a local name that resolves to no account). */
@@ -25,13 +26,15 @@ $local_entry = webauthn_session_is_local($_SESSION) ? webauthn_local_user($usern
 $uid = is_array($local_entry) ? (string)($local_entry['uid'] ?? '') : '';
 phpsession_end();
 /* page-all ("*") holders administer everyone's passkeys and the settings. */
-$is_admin = in_array('*', $allowedpages);
+$is_admin = in_array('*', $allowedpages ?? [], true);
 $tab = ($is_admin && ($_REQUEST['tab'] ?? '') == 'settings') ? 'settings' : 'passkeys';
 $settings = webauthn_settings();
 $source = webauthn_request_source($_SERVER, $settings);
 /* A user who already has a passkey may only add another from a session verified with one. */
 phpsession_begin();
 $may_register = $username !== '' && webauthn_may_register($settings, $_SESSION, $source, $is_admin);
+/* For greying out Remove buttons; webauthn_delete_credential() decides again under the config lock. */
+$session = $_SESSION;
 phpsession_end();
 $input_errors = [];
 $savemsg = '';
@@ -204,9 +207,16 @@ if ($tab == 'passkeys'):
 						<form method="post" style="display:inline">
 							<input type="hidden" name="act" value="delete" />
 							<input type="hidden" name="id" value="<?=htmlspecialchars($c['id'])?>" />
+<?php if (webauthn_may_delete($settings, $session, $source, (string)$c['id'], $is_admin)): ?>
 							<button type="submit" class="btn btn-xs btn-danger" onclick="return confirm('<?=gettext('Remove this passkey?')?>');">
 								<i class="fa-solid fa-trash-can icon-embed-btn"></i><?=gettext('Remove')?>
 							</button>
+<?php else: ?>
+							<button type="button" class="btn btn-xs btn-danger" disabled
+								title="<?=gettext('This is your last usable passkey: sign in with it (through a non-trusted path) before removing it, or ask an administrator.')?>">
+								<i class="fa-solid fa-trash-can icon-embed-btn"></i><?=gettext('Remove')?>
+							</button>
+<?php endif; ?>
 						</form>
 					</td>
 				</tr>
