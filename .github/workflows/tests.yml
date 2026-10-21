@@ -88,10 +88,17 @@ jobs:
           coverage: none
       - name: Check the hooks against pfsense/pfsense master (warns on drift)
         run: |
-          if sh tools/upstream_anchors.sh master; then
+          # Exit 1 is check_anchors.php finding a hook that does not apply (drift);
+          # anything else is a download failure, which must not pass as either.
+          rc=0
+          sh tools/upstream_anchors.sh master || rc=$?
+          if [ "$rc" -eq 0 ]; then
             echo "Hooks apply to pfSense master." >> "$GITHUB_STEP_SUMMARY"
-          else
+          elif [ "$rc" -eq 1 ]; then
             msg="pfSense master changed the code a hook is anchored to: the next pfSense release may need a new anchor (hook.inc)."
             echo "::warning title=pfSense master drift::$msg"
             echo "**Warning:** $msg" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::could not download pfSense master's files (exit $rc)"
+            exit 1
           fi

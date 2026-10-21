@@ -29,3 +29,20 @@ CI: [run 39584881826](https://github.com/Lukas0923xcv/web-auth-pfsense/actions/r
 | 6 | Code quality | 90 | — |
 | 7 | Documentation | 90 | — (small inaccuracies) |
 | 8 | Independent review | 50 (cap) | Needs a human review |
+
+## Round 2 — 2026-10-21, commit c5f9147
+
+CI: [run 39586604026](https://github.com/Lukas0923xcv/web-auth-pfsense/actions/runs/39586604026), all 7 jobs green.
+
+| # | Category | Score | Main gap |
+|---|---|---|---|
+| 1 | Cryptographic correctness | 92 | — |
+| 2 | Security design | 90 | — (reviewer's own adversarial pass: no unfixed medium+ issue) |
+| 3 | pfSense integration | 85 (cap) | **Owner:** VM test results issue on CE 2.8.1. The "2.8.1 release tag" does not exist on pfsense/pfsense (tags end at v2.5.2, branches at RELENG_2_7_2), so that wording cannot be met; CI checks the files of the official pfSense-2.8.1.pkg instead |
+| 4 | Install / supply chain | 86 | **Owner:** push tag v1.3.0 so the release workflow publishes the release the README pin matches |
+| 5 | Testing / CI | 92 | — |
+| 6 | Code quality | 90 | — |
+| 7 | Documentation | 90 | — |
+| 8 | Independent review | 50 (cap) | **Owner:** a human review, linked from SECURITY.md |
+
+Only the owner's items remain.

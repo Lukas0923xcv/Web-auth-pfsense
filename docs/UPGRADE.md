@@ -8,7 +8,7 @@ Run the install command from the [README](../README.md) again: it installs the p
 /usr/local/pkg/webauthn/hook.php status
 ```
 
-The first line shows the version; the other five must say `present`. After an update, every session has to confirm with its passkey once.
+The first line shows the version; the other five must say `present`. Sessions that are already verified stay verified (for at most 12 hours, as always).
 
 ## Upgrading pfSense
 
