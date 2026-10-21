@@ -40,10 +40,13 @@ release)
 	# The GUI's PHP files are in the "pfSense" package; look in pfSense-base too.
 	found=0
 	for name in pfSense pfSense-base; do
-		line=$(grep "\"name\":\"$name\"," "$dir/packagesite.yaml" | head -n 1)
-		[ -n "$line" ] || continue
-		path=$(echo "$line" | sed 's/.*"repopath":"\([^"]*\)".*/\1/')
-		version=$(echo "$line" | sed 's/.*"version":"\([^"]*\)".*/\1/')
+		# One JSON object per line; take this package's path and version.
+		# shellcheck disable=SC2016 # PHP code, not shell
+		info=$("$php" -r 'foreach (file($argv[1]) as $l) { $p = json_decode($l, true);
+			if (($p["name"] ?? "") === $argv[2]) { echo $p["repopath"], " ", $p["version"]; break; } }' "$dir/packagesite.yaml" "$name")
+		[ -n "$info" ] || continue
+		path=${info% *}
+		version=${info##* }
 		curl -fsSL --retry 3 -o "$dir/pkg" "$repo/$path"
 		if tar -tf "$dir/pkg" | grep -q 'etc/inc/authgui\.inc$'; then
 			echo "$name $version from $repo/$path"
