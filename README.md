@@ -13,7 +13,7 @@ Run this **single line** on the pfSense (console option 8, SSH, or paste it into
 It installs version <!-- pinned-version -->1.1.0<!-- /pinned-version -->, fixed to one commit. `sha256 -c` checks that the download is exactly that commit, so nothing pushed to the repository later can change what this command installs.
 
 ```sh
-cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/0000000000000000000000000000000000000000 && sha256 -c 0000000000000000000000000000000000000000000000000000000000000000 webauthn.tar.gz && rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
+cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/2b2de835efc356145924b979552df32c34fe5fd3 && sha256 -c f40669427add868fad11dfe60890d36e0bfd98643e99140762834dacd681d821 webauthn.tar.gz && rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
 
 When it worked, the output ends with `Installed version ...`. If the output is empty or shows an error, it did not install. If only the checksum fails, do not install: open an issue.
