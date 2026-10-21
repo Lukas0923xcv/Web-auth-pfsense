@@ -4,12 +4,13 @@ Adds a passkey / security-key (WebAuthn) step after the normal password login on
 
 ## Install / update
 
-Run on the pfSense (console option 8, SSH, or one line joined with `&&` in **Diagnostics > Command Prompt**). The same command updates an existing install and keeps your settings and passkeys.
+Run this **single line** on the pfSense (console option 8, SSH, or paste it into **Diagnostics > Command Prompt**). Paste it as one line: it must not be split. The same command updates an existing install and keeps your settings and passkeys.
 
 ```sh
-cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/refs/heads/claude/vigilant-cray-p2utgq
-rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
+cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/refs/heads/claude/vigilant-cray-p2utgq && rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd [Ww]eb-auth-pfsense-* && sh install.sh
 ```
+
+When it worked, the output ends with `WebAuthn hooks installed.` If the output is empty or shows an error, it did not install.
 
 Then check that everything is in place. The first line shows the installed version, the other five must say `present`:
 
@@ -26,7 +27,7 @@ The installer runs as root. To install a version you have reviewed, replace `ref
 ## Remove
 
 ```sh
-cd /root/web-auth-pfsense-* && sh uninstall.sh
+cd /root/[Ww]eb-auth-pfsense-* && sh uninstall.sh
 ```
 
 Without the downloaded folder, the same steps by hand:
