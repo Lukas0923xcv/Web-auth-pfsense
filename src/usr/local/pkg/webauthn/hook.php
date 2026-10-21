@@ -12,7 +12,7 @@
  *              are in place, 1 if not
  *   ensure     (re-)apply missing or outdated hooks. Runs early at boot
  *              (earlyshellcmd, before the GUI starts), from the rc.d script,
- *              and every 5 minutes from cron, since a pfSense upgrade
+ *              and every minute from cron, since a pfSense upgrade
  *              replaces the patched files.
  *
  * Licensed under the Apache License, Version 2.0.
@@ -24,6 +24,7 @@ require_once(__DIR__ . '/hook.inc');
 
 define('WEBAUTHN_MENU_URL', '/system_webauthn.php');
 define('WEBAUTHN_CRON_COMMAND', '/usr/local/bin/php -f /usr/local/pkg/webauthn/hook.php ensure');
+define('WEBAUTHN_CRON_MINUTE', '*');
 define('WEBAUTHN_UNINSTALLING', '/var/run/webauthn_uninstalling');
 
 /*
@@ -176,10 +177,15 @@ function earlyshellcmd_present(): bool {
 	return in_array(WEBAUTHN_CRON_COMMAND, is_array($cmds) ? $cmds : [$cmds], true);
 }
 
-/* Re-apply the hooks every 5 minutes; kept in config.xml, so it survives upgrades. */
+/*
+ * Re-apply the hooks every minute; kept in config.xml, so it survives
+ * upgrades. The job is cheap (it reads three files and writes only when
+ * a hook is missing) and keeps the unprotected window after an upgrade
+ * short.
+ */
 function set_cron(bool $present): void {
 	require_once('services.inc');
-	install_cron_job(WEBAUTHN_CRON_COMMAND, $present, '*/5');
+	install_cron_job(WEBAUTHN_CRON_COMMAND, $present, WEBAUTHN_CRON_MINUTE);
 }
 
 function set_menu(bool $present): void {
@@ -239,14 +245,17 @@ case 'status':
 		$ok = $ok && $state === 'present';
 		echo "{$target}: hook {$state}\n";
 	}
-	$cron = false;
+	$cron = 'MISSING';
 	foreach (config_get_path('cron/item', []) as $item) {
-		$cron = $cron || (($item['command'] ?? '') === WEBAUTHN_CRON_COMMAND);
+		if (($item['command'] ?? '') === WEBAUTHN_CRON_COMMAND) {
+			/* An older version ran it every 5 minutes: run install.sh again. */
+			$cron = (($item['minute'] ?? '') === WEBAUTHN_CRON_MINUTE) ? 'present' : 'OUTDATED';
+		}
 	}
-	echo 'cron: re-apply job ' . ($cron ? 'present' : 'MISSING') . "\n";
+	echo "cron: re-apply job {$cron}\n";
 	$early = earlyshellcmd_present();
 	echo 'boot: earlyshellcmd ' . ($early ? 'present' : 'MISSING') . "\n";
-	exit($ok && $cron && $early ? 0 : 1);
+	exit($ok && $cron === 'present' && $early ? 0 : 1);
 default:
 	fwrite(STDERR, "usage: {$argv[0]} install|uninstall|status|ensure\n");
 	exit(2);
