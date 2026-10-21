@@ -10,10 +10,10 @@ Adds a passkey / security-key (WebAuthn) step after the normal password login on
 
 Run this **single line** on the pfSense (console option 8, SSH, or **Diagnostics > Command Prompt**). It must not be split. The same command updates an existing install and keeps your settings and passkeys.
 
-It installs version <!-- pinned-version -->1.1.0<!-- /pinned-version -->, the commit of that release. `sha256 -c` checks that the download is exactly that commit (the same hash as the release's `SHA256SUMS`), so nothing pushed later can change what this command installs.
+It installs version <!-- pinned-version -->1.2.0<!-- /pinned-version -->, the commit of that release. `sha256 -c` checks that the download is exactly that commit (the same hash as the release's `SHA256SUMS`), so nothing pushed later can change what this command installs.
 
 ```sh
-cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/2b2de835efc356145924b979552df32c34fe5fd3 && sha256 -c f40669427add868fad11dfe60890d36e0bfd98643e99140762834dacd681d821 webauthn.tar.gz && rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
+cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/7751500aff24fe3574aa344607fa99368539f063 && sha256 -c f1a1b2df67e7e83a241f41874e635511d3e2760edfc1cc7c21bf30fc12c80a6f webauthn.tar.gz && rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
 
 When it worked, the output ends with `Installed version ...`. Then check:
