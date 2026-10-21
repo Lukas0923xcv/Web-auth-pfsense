@@ -7,6 +7,11 @@ $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-r3-count.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-r3.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-r3-used.json");
+define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-r3-revoked.json");
+define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-r3-config");
+define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-r3-notices.json");
+@unlink(WEBAUTHN_REVOKED_FILE);
+@unlink(WEBAUTHN_NOTICE_FILE);
 @unlink(WEBAUTHN_USED_FILE);
 
 $GLOBALS['test_config'] = [];
@@ -30,7 +35,9 @@ function config_set_path($path, $value) {
 	}
 	$c = $value;
 }
-function write_config($desc) {}
+function write_config($desc) { return $GLOBALS['test_config']; }
+/* The in-memory config is the one on disk (see tests/review4 for the snapshot case). */
+function config_read_file(bool $use_backup = false, bool $use_cache = true): bool { return true; }
 function phpsession_begin() {}
 function phpsession_end($w = false) {}
 if (!function_exists('gettext')) {
@@ -67,7 +74,9 @@ $ldap = ['remoteauth' => true, 'authsource' => 'LDAP/corp'];
 $local = ['remoteauth' => true, 'authsource' => 'Local Database'];
 
 function reset_config(array $settings, array $users): void {
-	$GLOBALS['test_config'] = ['installedpackages' => ['webauthn' => ['config' => [$settings], 'item' => []]]];
+	$GLOBALS['test_config'] = ['installedpackages' => ['webauthn' => ['config' => [$settings], 'item' => []]],
+	    'system' => ['user' => [['name' => 'admin', 'uid' => '0'], ['name' => 'bob', 'uid' => '2000'], ['name' => 'Bob', 'uid' => '2001'],
+	    ['name' => 'Admin', 'uid' => '2002'], ['name' => 'carol', 'uid' => '2003']]]];
 	foreach ($users as $u) {
 		$a = new FakeAuthenticator(WEBAUTHN_ALG_ES256);
 		$ch = random_bytes(32);
@@ -118,7 +127,8 @@ check(webauthn_session_status($settings, ['Username' => 'Bob'] + $ldap, $tunnel)
  */
 reset_config($settings, ['admin']);
 $cred = webauthn_get_credentials('admin')[0]['id'];
-$session = ['Username' => 'admin', 'webauthn' => ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred]];
+$session = ['Username' => 'admin', 'webauthn' => ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred,
+    'time' => time(), 'sid' => '', 'rp_id' => $rp, 'uv' => false]];
 check(webauthn_session_status($settings, $session, $tunnel) === 'verified', 'R2 setup: session verified');
 webauthn_delete_credential($cred, null);
 $st = webauthn_session_status($settings, $session, $tunnel);
@@ -139,7 +149,7 @@ check(webauthn_may_register($settings, ['Username' => 'carol'] + $ldap, $lan_tru
 check(webauthn_may_register($settings, ['Username' => 'Admin'] + $local, $lan_trusted), 'R4 a distinct local user "Admin" may enrol its own');
 $cred = webauthn_get_credentials('admin')[0]['id'];
 check(webauthn_may_register($settings, ['Username' => 'admin', 'webauthn' => ['user' => 'admin', 'method' => 'webauthn',
-    'credential' => $cred]] + $ldap, $tunnel), 'R4 a passkey-verified session may add another');
+    'credential' => $cred, 'time' => time(), 'sid' => '', 'rp_id' => $rp, 'uv' => false]] + $ldap, $tunnel), 'R4 a passkey-verified session may add another');
 
 /*
  * R5. While WebAuthn is enabled, XMLRPC (password only, exec_shell) is

@@ -17,7 +17,13 @@
 require_once("guiconfig.inc");
 require_once("/usr/local/pkg/webauthn/webauthn.inc");
 
-$username = webauthn_normalize_username($_SESSION['Username']);
+phpsession_begin();
+/* The account passkeys belong to ('' for a local name that resolves to no account). */
+$username = webauthn_session_identity($_SESSION);
+/* For local accounts the uid is stored too, so a new account with the same name does not inherit them. */
+$local_entry = webauthn_session_is_local($_SESSION) ? webauthn_local_user($username) : null;
+$uid = is_array($local_entry) ? (string)($local_entry['uid'] ?? '') : '';
+phpsession_end();
 /* page-all ("*") holders administer everyone's passkeys and the settings. */
 $is_admin = in_array('*', $allowedpages);
 $tab = ($is_admin && ($_REQUEST['tab'] ?? '') == 'settings') ? 'settings' : 'passkeys';
@@ -25,7 +31,7 @@ $settings = webauthn_settings();
 $source = webauthn_request_source($_SERVER, $settings);
 /* A user who already has a passkey may only add another from a session verified with one. */
 phpsession_begin();
-$may_register = webauthn_may_register($settings, $_SESSION, $source);
+$may_register = $username !== '' && webauthn_may_register($settings, $_SESSION, $source, $is_admin);
 phpsession_end();
 $input_errors = [];
 $savemsg = '';
@@ -39,40 +45,39 @@ if ($_POST['act'] == 'register') {
 	phpsession_begin();
 	try {
 		$client_data = webauthn_b64url_decode((string)$_POST['reg_client_data']);
+		$attestation = webauthn_b64url_decode((string)$_POST['reg_attestation']);
 	} catch (WebAuthnException $e) {
-		$client_data = '';
+		$client_data = $attestation = '';
 	}
-	$challenge = webauthn_take_challenge('register', $username, $client_data);
 	$name = trim((string)$_POST['passkey_name']);
-	if (!$may_register) {
+	if ($username === '') {
+		$input_errors[] = gettext('Your account could not be found in the user database.');
+	} elseif (!$may_register) {
 		$input_errors[] = gettext('You already have a passkey: sign in with it (through a non-trusted path) before adding another.');
-	} elseif ($challenge === null) {
-		$input_errors[] = gettext('The registration request expired or was already used. Try again.');
-	} elseif ($name === '' || strlen($name) > 64) {
-		$input_errors[] = gettext('Enter a passkey name of up to 64 characters.');
+	} elseif (!webauthn_valid_passkey_name($name)) {
+		$input_errors[] = gettext('Enter a passkey name of up to 64 characters: letters, digits, spaces and . _ ( ) - only.');
 	} elseif (webauthn_rp_id($settings) === '') {
 		$input_errors[] = gettext('Configure an RP ID on the Settings tab first.');
 	} else {
 		try {
-			$reg = webauthn_verify_registration(
-				$client_data,
-				webauthn_b64url_decode((string)$_POST['reg_attestation']),
-				$challenge,
-				webauthn_rp_id($settings),
-				webauthn_allowed_origins($settings),
-				webauthn_require_uv($settings)
-			);
-			foreach (webauthn_get_credentials() as $c) {
-				if ($c['id'] === webauthn_b64url_encode($reg['credential_id'])) {
-					throw new WebAuthnException(gettext('This passkey is already registered.'));
-				}
+			/* The challenge counts as used only once the response verified. */
+			$reg = webauthn_use_challenge('register', $username, $client_data, function ($challenge) use ($client_data, $attestation, $settings) {
+				return webauthn_verify_registration($client_data, $attestation, $challenge, webauthn_rp_id($settings),
+				    webauthn_allowed_origins($settings), webauthn_require_uv($settings));
+			});
+			if ($reg === null) {
+				throw new WebAuthnException(gettext('The registration request expired or was already used. Try again.'));
 			}
-			webauthn_add_credential($username, $name, $reg, webauthn_rp_id($settings));
-			/* Holding a passkey just proven to the server satisfies the gate. */
-			$_SESSION['webauthn'] = ['user' => $username, 'method' => 'webauthn',
-			    'credential' => webauthn_b64url_encode($reg['credential_id']), 'time' => time()];
+			$error = webauthn_add_credential($username, $name, $reg, webauthn_rp_id($settings), $uid);
+			if ($error !== null) {
+				throw new WebAuthnException($error);
+			}
+			/* Holding a passkey just proven to the server satisfies the gate; new session ID as after a passkey sign-in. */
+			session_regenerate_id(true);
+			$_SESSION['webauthn'] = webauthn_verified_state($username, ['id' => webauthn_b64url_encode($reg['credential_id'])],
+			    !empty($reg['uv']), $settings);
 			webauthn_log(LOG_NOTICE, "user '{$username}' registered passkey '{$name}'", $source);
-			webauthn_notice(sprintf('Passkey "%s" was registered for user %s from %s.', $name, $username, $source['client']));
+			webauthn_notice(sprintf('Passkey "%s" was registered for user "%s" from %s.', $name, $username, $source['client']));
 			phpsession_end(true);
 			/* Redirect so a reload does not resubmit the used challenge. */
 			header('Location: system_webauthn.php?registered=' . urlencode($name));
@@ -85,13 +90,24 @@ if ($_POST['act'] == 'register') {
 	phpsession_end(true);
 } elseif ($_POST['act'] == 'delete') {
 	$id = (string)$_POST['id'];
-	if (webauthn_delete_credential($id, $is_admin ? null : $username)) {
-		webauthn_log(LOG_NOTICE, "user '{$username}' removed passkey {$id}", $source);
-		webauthn_notice(sprintf('A passkey was removed by user %s from %s.', $username, $source['client']));
+	phpsession_begin();
+	$may_delete = webauthn_may_delete($settings, $_SESSION, $source, $id, $is_admin);
+	phpsession_end();
+	if (!$is_admin && $username === '') {
+		$input_errors[] = gettext('Passkey not found.');
+	} elseif (!$may_delete) {
+		$input_errors[] = gettext('This is your last passkey: sign in with it (through a non-trusted path) before removing it, or ask an administrator.');
+	} elseif (webauthn_delete_credential($id, $is_admin ? null : $username)) {
+		webauthn_log(LOG_NOTICE, "user '{$username}' removed passkey " . webauthn_plain($id, 200), $source);
+		webauthn_notice(sprintf('A passkey was removed by user "%s" from %s.', $username, $source['client']));
 		header('Location: system_webauthn.php?removed=1');
 		exit;
-	} else {
+	} elseif (empty(array_filter(webauthn_get_credentials($is_admin ? null : $username), function ($c) use ($id) {
+		return ($c['id'] ?? null) === $id;
+	}))) {
 		$input_errors[] = gettext('Passkey not found.');
+	} else {
+		$input_errors[] = gettext('The passkey could not be removed. Check the system log.');
 	}
 } elseif ($_POST['save'] && $is_admin) {
 	$new = [
@@ -105,19 +121,22 @@ if ($_POST['act'] == 'register') {
 		'xmlrpc_peers' => implode(' ', webauthn_split_list($_POST['xmlrpc_peers'])),
 	];
 	$input_errors = webauthn_validate_settings($new);
-	if (empty($input_errors) && $new['enable'] &&
-	    webauthn_gate_decision($new, webauthn_request_source($_SERVER, $new), !empty(webauthn_get_credentials($username))) == 'deny') {
-		$input_errors[] = gettext('These settings would lock you out of this session: register a passkey for your account, or save from a trusted network.');
+	if (empty($input_errors)) {
+		$lockout = webauthn_settings_lockout_error($new, webauthn_request_source($_SERVER, $new), webauthn_get_credentials($username));
+		if ($lockout !== null) {
+			$input_errors[] = $lockout;
+		}
+	}
+	if (empty($input_errors) && !webauthn_save_settings($new)) {
+		$input_errors[] = gettext('The settings could not be saved.');
 	}
 	if (empty($input_errors)) {
-		config_set_path(WEBAUTHN_CONFIG_PATH, $new);
-		write_config(gettext('WebAuthn: settings changed'));
 		$settings = webauthn_settings();
 		$source = webauthn_request_source($_SERVER, $settings);
 		$savemsg = gettext('Settings saved.');
 		webauthn_log(LOG_NOTICE, "user '{$username}' changed WebAuthn settings (enable=" . ($new['enable'] ? 'yes' : 'no') .
 		    ", enforce=" . ($new['enforce'] ? 'yes' : 'no') . ")", $source);
-		webauthn_notice(sprintf('WebAuthn settings were changed by user %s from %s (enabled: %s, enforced: %s).',
+		webauthn_notice(sprintf('WebAuthn settings were changed by user "%s" from %s (enabled: %s, enforced: %s).',
 		    $username, $source['client'], $new['enable'] ? 'yes' : 'no', $new['enforce'] ? 'yes' : 'no'));
 	} else {
 		$settings = array_merge($settings, $new);
@@ -164,7 +183,7 @@ display_top_tabs($tab_array);
 
 if ($tab == 'passkeys'):
 	if (empty($settings['enable'])) {
-		print_info_box(gettext('The WebAuthn second factor is disabled. Passkeys can still be registered.'), 'warning', false);
+		print_info_box(gettext('The WebAuthn second factor is disabled. A first passkey can still be registered; further ones only by an administrator.'), 'warning', false);
 	}
 	$creds = $is_admin ? webauthn_get_credentials() : webauthn_get_credentials($username);
 ?>
@@ -179,7 +198,7 @@ if ($tab == 'passkeys'):
 			<tbody>
 <?php foreach ($creds as $c): ?>
 				<tr>
-					<td><?=htmlspecialchars($c['username'])?></td>
+					<td><?=htmlspecialchars($c['username'])?><?=webauthn_orphaned($c) ? ' <span class="text-danger">(' . gettext('belongs to a deleted account') . ')</span>' : ''?></td>
 					<td><?=htmlspecialchars($c['name'])?></td>
 					<td><?=htmlspecialchars($c['rp_id'])?><?=($c['rp_id'] !== webauthn_rp_id($settings)) ? ' <span class="text-danger">(' . gettext('does not match current RP ID') . ')</span>' : ''?></td>
 					<td><?=htmlspecialchars(date('Y-m-d H:i', (int)$c['created']))?></td>
@@ -226,6 +245,13 @@ if ($tab == 'passkeys'):
 <script>webauthnRegisterInit();</script>
 <?php
 else:
+	$remote_auth = array_filter(config_get_path('system/authserver', []), function ($a) {
+		return is_array($a) && in_array($a['type'] ?? '', ['ldap', 'radius'], true);
+	});
+	if (!empty($remote_auth) && empty($settings['enforce'])) {
+		print_info_box(gettext('LDAP or RADIUS servers are configured and Enforce is off. Such servers may accept other spellings ' .
+		    'of a username than the one a passkey was registered for. Turn Enforce on, so every account without a passkey is refused.'), 'warning', false);
+	}
 	$form = new Form();
 	$form->addGlobal(new Form_Input('tab', null, 'hidden', 'settings'));
 

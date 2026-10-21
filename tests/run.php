@@ -25,13 +25,20 @@ function config_set_path($path, $value) {
 	}
 	$c = $value;
 }
-function write_config($desc) {}
+function write_config($desc) { return $GLOBALS['test_config']; }
+/* The in-memory config is the one on disk (see tests/review4 for the snapshot case). */
+function config_read_file(bool $use_backup = false, bool $use_cache = true): bool { return true; }
 if (!function_exists("gettext")) { function gettext($s) { return $s; } }
 
 $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-test-count.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-test.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-test-used.json");
+define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-test-revoked.json");
+define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-test-config");
+define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-test-notices.json");
+@unlink(WEBAUTHN_REVOKED_FILE);
+@unlink(WEBAUTHN_NOTICE_FILE);
 
 $root = dirname(__DIR__) . '/src/usr/local/pkg/webauthn';
 require_once("$root/webauthn.inc");
@@ -226,7 +233,8 @@ $one = ['username' => 'admin', 'name' => 'Proton Pass', 'id' => 'abc', 'alg' => 
 config_set_path(WEBAUTHN_CRED_PATH, $one);
 check(count(webauthn_get_credentials('admin')) === 1, 'lone <credential> element read as one passkey');
 check(webauthn_delete_credential('abc', 'admin') && count(webauthn_get_credentials()) === 0, 'lone credential deletable');
-config_set_path(WEBAUTHN_CRED_PATH, [$one, array_merge($one, ['id' => 'def', 'username' => 'bob'])]);
+/* "abc" was removed above and is now revoked: a record brought back with that ID stays ignored (see tests/review4). */
+config_set_path(WEBAUTHN_CRED_PATH, [array_merge($one, ['id' => 'ghi']), array_merge($one, ['id' => 'def', 'username' => 'bob'])]);
 check(count(webauthn_get_credentials()) === 2 && count(webauthn_get_credentials('bob')) === 1, 'credential list read');
 config_set_path(WEBAUTHN_CRED_PATH, '');
 check(webauthn_get_credentials() === [], 'empty credential element');

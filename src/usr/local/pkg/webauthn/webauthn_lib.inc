@@ -302,10 +302,11 @@ function webauthn_verify_registration(string $client_data_json, string $attestat
 /*
  * Verify an assertion (navigator.credentials.get()) response against a
  * stored credential (['alg' => int, 'pem' => string, 'sign_count' => int]).
- * Returns the new signature counter.
+ * Returns the new signature counter. $info, if passed, receives
+ * ['flags' => int, 'uv' => bool] of the verified authenticator data.
  */
 function webauthn_verify_assertion(array $credential, string $client_data_json, string $authenticator_data,
-    string $signature, string $challenge, string $rp_id, array $allowed_origins, bool $require_uv): int {
+    string $signature, string $challenge, string $rp_id, array $allowed_origins, bool $require_uv, ?array &$info = null): int {
 	webauthn_check_client_data($client_data_json, 'webauthn.get', $challenge, $allowed_origins);
 
 	$ad = webauthn_parse_auth_data($authenticator_data);
@@ -324,5 +325,6 @@ function webauthn_verify_assertion(array $credential, string $client_data_json, 
 	if (($ad['sign_count'] != 0 || $stored != 0) && $ad['sign_count'] <= $stored) {
 		throw new WebAuthnException('Signature counter did not increase; the authenticator may be cloned');
 	}
+	$info = ['flags' => $ad['flags'], 'uv' => (bool)($ad['flags'] & WEBAUTHN_FLAG_UV)];
 	return $ad['sign_count'];
 }

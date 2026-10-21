@@ -8,20 +8,25 @@ Target: pfSense CE 2.8.1. The hook anchors on the `session_auth()` block in `/et
 
 1. The password login is unchanged (`session_auth()`).
 2. Immediately after it, and before pfSense checks page privileges, `webauthn_gate()` runs on every GUI request. If the session has not yet passed WebAuthn, the gate shows a "Use passkey" page instead of the requested page.
-3. The browser signs a single-use challenge: a random nonce with a 5-minute lifetime, HMAC-bound to the session, the user, and the purpose. Challenges are not stored in the session, so loading the page again does not invalidate one already in use. The server verifies the RP ID hash, the origin, the user-presence flag (and user verification if required), the signature, and the signature counter. On success it regenerates the session ID and lets the request through.
+3. The browser signs a single-use challenge: a random nonce with a 5-minute lifetime, HMAC-bound to the session, the user, and the purpose. Challenges are not stored in the session, so loading the page again does not invalidate one already in use. The server verifies the RP ID hash, the origin, the user-presence flag (and user verification if required), the signature, and the signature counter (advanced atomically, so a cloned authenticator racing the real one is caught). A challenge counts as used only once its response verified, so failed attempts cannot fill the list of used challenges. On success it regenerates the session ID and lets the request through.
+4. The verification belongs to that one login: it is bound to the session ID, which pfSense renews at every password sign-in, so signing in again (or a login POST into the session) requires the passkey again. It also expires after **12 hours**, and is dropped when the RP ID changes or user verification becomes *Required* while it was made without.
 
 Supported algorithms: ES256, RS256, and Ed25519 (when PHP's sodium extension is present). These cover current platform passkeys (iCloud Keychain, Google Password Manager, Windows Hello) and hardware keys (YubiKey and others). Attestation is not requested (`attestation: "none"`).
 
-Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, so they are included in config backups. Signature counters and the list of used challenges are kept in `/conf` (`webauthn_signcount.json`, `webauthn_used_challenges.json`) so that a login does not create a new config revision.
+Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, so they are included in config backups. Signature counters, the list of used challenges, the list of removed passkey IDs and the notice rate limit are kept in `/conf` (`webauthn_signcount.json`, `webauthn_used_challenges.json`, `webauthn_revoked.json`, `webauthn_notices.json`) so that a login does not create a new config revision. Changes to passkeys and settings are made under a lock on the configuration as it is on disk at that moment, so two parallel requests cannot undo each other's changes. If `webauthn_revoked.json` is ever damaged, no passkey is accepted until it is repaired or removed (fail closed; the system log says so).
 
 ## Install
 
-From a pfSense shell (console option 8, SSH), or as one line joined with `&&` in **Diagnostics > Command Prompt**. Running the same command again updates an existing install and keeps settings and passkeys:
+From a pfSense shell (console option 8, SSH), or as one line joined with `&&` in **Diagnostics > Command Prompt**. Running the same command again updates an existing install and keeps settings and passkeys.
+
+Install a commit you have reviewed, not a branch: replace `<commit-sha>` with the full commit ID from the repository's commit list (GitHub: **Commits**, copy the full SHA).
 
 ```sh
-cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/refs/heads/claude/vigilant-cray-p2utgq
+cd /root && fetch -o webauthn.tar.gz https://codeload.github.com/Lukas0923xcv/web-auth-pfsense/tar.gz/<commit-sha>
 rm -rf [Ww]eb-auth-pfsense-* && tar xzf webauthn.tar.gz && cd web-auth-pfsense-* && sh install.sh
 ```
+
+Updating from an earlier version signs every session out of the passkey step once: older verifications carry no session binding and are not trusted.
 
 The installer copies the files, lint-checks them, patches `/etc/inc/authgui.inc`, `/etc/inc/auth_check.inc` and `/usr/local/www/xmlrpc.php` (keeping copies with the suffix `.webauthn.orig`, which pfSense's web server refuses to serve), adds **System > WebAuthn Passkeys** to the menu, and registers the boot command and cron job that re-apply the patches. The second factor stays **disabled** until you turn it on.
 
@@ -119,17 +124,19 @@ When you reach the GUI by an IP or another unlisted name from outside a trusted 
 3. Open the GUI on an allowed hostname, then **Passkeys > Register passkey**. Register at least two authenticators.
 4. Turn on **Enforce**. Users without a passkey are then refused, except from trusted networks. The settings page refuses to save a change that would lock out the session making it.
 
-Once a user has a passkey, adding another requires a session that signed in **with** a passkey. A password alone, even from a trusted network, cannot enrol an extra passkey. Removing a passkey signs out the sessions it verified at their next request, even when it was the user's last passkey.
+Once a user has a passkey, adding another requires a session that signed in **with** a passkey. A password alone, even from a trusted network, cannot enrol an extra passkey. While the second factor is disabled nobody signs in with a passkey, so then only an admin can add a further passkey to an account that has one; the first passkey of an account always needs only the password. Users other than admins cannot remove their **last** passkey without a passkey-verified session.
 
-Recovery, if every passkey is lost: log in from a trusted network, remove the lost passkeys, then register a new one. Without a trusted network, run `/usr/local/pkg/webauthn/hook.php uninstall` from the console.
+Removing a passkey signs out the sessions it verified at their next request, even when it was the user's last passkey. Its ID is also recorded as revoked in `/conf/webauthn_revoked.json`: it is never accepted again, even if a config restore or a parallel change brings the record back. Passkeys registered by a local account remember the account's uid; if the account is deleted and a new one is created with the same name, the old passkeys do not count for it and are shown as "belongs to a deleted account" (passkeys registered before this version, and passkeys of LDAP/RADIUS accounts, have no uid and are bound to the name only).
 
-Passkeys belong to the **exact** username, because pfSense local accounts are case-sensitive: `Bob` and `bob` can be two different people, and each is treated on its own. LDAP and RADIUS accept other spellings for the same person: a different capitalisation, a `@domain` or `\suffix` (pfSense's LDAP code drops both), a RADIUS realm (`CORP\admin`, `corp/admin`), or full-width, extra-space and invisible-character variants. So if `admin` has passkeys, signing in through LDAP or RADIUS as `Admin`, `admin@corp` or `CORP\admin` is stopped with a message to use the registered spelling, rather than skipping the passkey step. Such a spelling also cannot enrol a passkey of its own without a passkey-verified session. With LDAP or RADIUS, turn **Enforce** on as well: it refuses every account without a passkey, whatever the backend accepts as a name.
+Recovery, if every passkey is lost: an admin logs in from a trusted network, removes the lost passkeys, then registers a new one. Users other than admins ask an admin. Without a trusted network, run `/usr/local/pkg/webauthn/hook.php uninstall` from the console.
+
+Passkeys belong to the **exact** username, because pfSense local accounts are case-sensitive: `Bob` and `bob` can be two different people, and each is treated on its own. LDAP and RADIUS accept other spellings for the same person: a different capitalisation, a `@domain` or `\suffix` (pfSense's LDAP code drops both), a RADIUS realm (`CORP\admin`, `corp/admin`), `user%realm`, or full-width, katakana/hiragana, extra-space and invisible-character variants. So if `admin` has passkeys, signing in through LDAP or RADIUS as `Admin`, `admin@corp` or `CORP\admin` is stopped with a message to use the registered spelling, rather than skipping the passkey step. Such a spelling also cannot enrol a passkey of its own without a passkey-verified session. **With LDAP or RADIUS, turn Enforce on.** Recognising other spellings is a best effort: a directory may accept names this package cannot foresee. Enforce refuses every account without a passkey, whatever the backend accepts as a name; the Settings tab warns while LDAP or RADIUS servers exist and Enforce is off. If PHP's intl or mbstring extension is missing, every passkey counts for every LDAP/RADIUS user (they then all need their own passkey). For local accounts the sign-in name is resolved through pfSense's user database; a name that resolves to no account is refused.
 
 Users with the `page-all` privilege (admins) manage everyone's passkeys and the settings. Other users can register and remove only their own passkeys, if they are granted access to `system_webauthn.php`.
 
 ## Security notes and limits
 
-**What is covered:** every web GUI page. That includes the lightweight status endpoints such as `getstats.php`, which use `auth_check.inc`: a hook makes them ignore the session's cached page privileges unless the session has passed the gate (or is exempt for this request). XMLRPC is refused when it arrives through the tunnel and, while the second factor is enabled, from hosts that are not XMLRPC peers or on a trusted network. Passkey registrations and removals, settings changes, and 5 failed passkey attempts after a correct password each raise a GUI notice. The notice is also sent by e-mail or another notification channel, if you have one configured.
+**What is covered:** every web GUI page. That includes the lightweight status endpoints such as `getstats.php`, which use `auth_check.inc`: a hook makes them ignore the session's cached page privileges unless the session has passed the gate (or is exempt for this request). XMLRPC is refused when it arrives through the tunnel and, while the second factor is enabled, from hosts that are not XMLRPC peers or on a trusted network. Passkey registrations and removals, settings changes, and 5 failed passkey attempts after a correct password each raise a GUI notice (failed attempts at most once per user every 15 minutes). The notice is also sent by e-mail or another notification channel, if you have one configured. Names in notices and config history are reduced to one line of plain text and quoted, so a crafted LDAP name cannot forge lines. Passkey names may contain letters, digits, spaces and `. _ ( ) -` only (up to 64 characters), because pfSense writes control characters into config.xml unchanged, which would make it unreadable.
 
 **What is not covered:**
 - `/xmlrpc.php` from a configured XMLRPC peer or a trusted network (password only). It is refused from everywhere else while the second factor is enabled.
@@ -143,7 +150,7 @@ Users with the `page-all` privilege (admins) manage everyone's passkeys and the 
 
 Errors inside the gate fail closed: the page does not load.
 
-**Trusted networks** skip the passkey entirely. An admin session from a trusted network is effectively root: it can turn the second factor off, remove passkeys, or run shell commands under Diagnostics > Command Prompt. The rule that a second passkey needs a passkey-verified session only slows such an attacker down. Every one of those changes raises a notice, but the real protection is keeping trusted networks narrow. Keep the list as narrow as possible: a management VLAN, rather than a whole LAN with guests and IoT devices. A single address inside a shared LAN is weak: any host on that segment can take the address over while your PC is off.
+**Trusted networks** skip the passkey entirely. Trusted networks and XMLRPC peers must be at least `/8` (IPv4) or `/16` (IPv6). Saving an RP ID that none of your passkeys was registered for is refused unless you save from a trusted network. An admin session from a trusted network is effectively root: it can turn the second factor off, remove passkeys, or run shell commands under Diagnostics > Command Prompt. The rule that a second passkey needs a passkey-verified session only slows such an attacker down. Every one of those changes raises a notice, but the real protection is keeping trusted networks narrow. Keep the list as narrow as possible: a management VLAN, rather than a whole LAN with guests and IoT devices. A single address inside a shared LAN is weak: any host on that segment can take the address over while your PC is off.
 
 **User verification:** *Required* makes the authenticator ask for a PIN or biometric on every use. Choose it if your authenticators support it.
 
@@ -158,6 +165,9 @@ php tests/audit_test.php                 # security audit regressions F1-F7, inc
 php tests/review3/review3_test.php       # third review: username spellings, revocation, XMLRPC peers, nonce list (44 checks)
 php tests/review3/gate_ldap_variant.php  # third review, end to end through the gate (5 checks)
 php tests/review3/fuzz_parsers.php       # mutation fuzz of the CBOR / authenticator data / COSE parsers
+php tests/review4/review4_test.php       # fourth review: counter, verification binding, lost updates, names, uid, hardening (107 checks)
+php tests/review4/gate_review4.php       # fourth review, end to end through the gate (14 checks)
+php tests/review4/reload_fallback.php    # fourth review: config reload on pfSense versions without config_read_file() (4 checks)
 sh tests/review3/hook_enospc.sh          # root on Linux: patching on a full disk leaves authgui.inc untouched
 ```
 

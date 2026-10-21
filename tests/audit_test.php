@@ -9,6 +9,11 @@ $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-audit-count.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-audit.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-audit-used.json");
+define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-audit-revoked.json");
+define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-audit-config");
+define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-audit-notices.json");
+@unlink(WEBAUTHN_REVOKED_FILE);
+@unlink(WEBAUTHN_NOTICE_FILE);
 
 $GLOBALS['test_config'] = [];
 function config_get_path($path, $default = null) {
@@ -31,7 +36,9 @@ function config_set_path($path, $value) {
 	}
 	$c = $value;
 }
-function write_config($desc) {}
+function write_config($desc) { return $GLOBALS['test_config']; }
+/* The in-memory config is the one on disk (see tests/review4 for the snapshot case). */
+function config_read_file(bool $use_backup = false, bool $use_cache = true): bool { return true; }
 if (!function_exists('gettext')) {
 	function gettext($s) { return $s; }
 }
@@ -111,6 +118,7 @@ if (!function_exists("gettext")) { function gettext($s) { return $s; } }');
 define("WEBAUTHN_COUNTER_FILE", ' . var_export("$tmp/webauthn-audit-count.json", true) . ');
 define("WEBAUTHN_KEY_FILE", ' . var_export("$tmp/webauthn-audit.key", true) . ');
 define("WEBAUTHN_USED_FILE", ' . var_export("$tmp/webauthn-audit-used.json", true) . ');
+define("WEBAUTHN_REVOKED_FILE", ' . var_export("$tmp/webauthn-audit-revoked.json", true) . ');
 $GLOBALS["cfg"] = ' . var_export($config, true) . ';
 $_SESSION = ' . var_export($session, true) . ';
 $_SERVER = array_merge($_SERVER, ' . var_export($server + ['REQUEST_URI' => '/getstats.php'], true) . ');
@@ -130,7 +138,8 @@ check(run_auth_check($patched, $config, ['Username' => 'admin', 'page-match' => 
 check(run_auth_check($patched, $config, ['Username' => 'admin', 'page-match' => $pm], $tunnel) === 'AUTHGUI',
     'F1: password-only session with stale page-match falls through to authgui');
 check(run_auth_check($patched, $config, ['Username' => 'admin', 'page-match' => $pm,
-    'webauthn' => ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred['record']['id']]], $tunnel) === 'CACHED',
+    'webauthn' => ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred['record']['id'],
+    'time' => time(), 'sid' => '', 'rp_id' => $rp, 'uv' => false]], $tunnel) === 'CACHED',
     'F1: passkey-verified session keeps the fast path');
 check(run_auth_check($patched, $config, ['Username' => 'admin', 'page-match' => $pm,
     'webauthn' => ['user' => 'admin', 'method' => 'trusted-network']], $lan) === 'CACHED',

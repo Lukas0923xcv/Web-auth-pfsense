@@ -14,6 +14,9 @@ $tmp = sys_get_temp_dir();
 define('WEBAUTHN_COUNTER_FILE', "$tmp/webauthn-test-count.json");
 define('WEBAUTHN_KEY_FILE', "$tmp/webauthn-test.key");
 define('WEBAUTHN_USED_FILE', "$tmp/webauthn-test-used.json");
+define('WEBAUTHN_REVOKED_FILE', "$tmp/webauthn-test-revoked.json");
+define('WEBAUTHN_CONFIG_LOCK', "$tmp/webauthn-test-config");
+define('WEBAUTHN_NOTICE_FILE', "$tmp/webauthn-test-notices.json");
 
 function config_get_path($path, $default = null) {
 	$c = $GLOBALS['test_config'];
@@ -31,12 +34,14 @@ function config_set_path($path, $value) {
 	}
 	$c = $value;
 }
-function write_config($d) {}
+function write_config($d) { return $GLOBALS['test_config']; }
+/* The in-memory config is the one on disk (see tests/review4 for the snapshot case). */
+function config_read_file(bool $use_backup = false, bool $use_cache = true): bool { return true; }
 function phpsession_begin() {}
 function phpsession_end($w = false) {}
 function phpsession_destroy() { $GLOBALS['destroyed'] = true; }
 function isAjax() { return false; }
-function get_user_settings($u) { return []; }
+function get_user_settings($u) { return $GLOBALS['req_user_settings'] ?? []; }
 function g_get($k) { return 'pfSense'; }
 
 require __DIR__ . '/helpers.inc';
@@ -44,6 +49,12 @@ require dirname(__DIR__) . '/src/usr/local/pkg/webauthn/gate.inc';
 
 $_SERVER = array_merge(['REQUEST_URI' => '/firewall_rules.php', 'HTTP_HOST' => 'pfsense.example.com'], $req['server'] ?? []);
 $_POST = $req['post'] ?? [];
+$_COOKIE = $req['cookie'] ?? [];
+$GLOBALS['req_user_settings'] = $req['user_settings'] ?? [];
+if (!empty($req['block_counter'])) {
+	/* A directory where the counter's temp file would go: the counter cannot be written. */
+	@mkdir(WEBAUTHN_COUNTER_FILE . '.' . getmypid() . '.tmp');
+}
 
 /* Sign with the stored authenticator if asked, using a challenge from an earlier page. */
 if (!empty($req['sign'])) {
@@ -61,6 +72,7 @@ if (!empty($req['sign'])) {
 
 ob_start();
 register_shutdown_function(function () use ($stateFile, &$st) {
+	@rmdir(WEBAUTHN_COUNTER_FILE . '.' . getmypid() . '.tmp');
 	$html = ob_get_clean();
 	echo $html;
 	if (preg_match('/data-options="([^"]+)"/', $html, $m)) {

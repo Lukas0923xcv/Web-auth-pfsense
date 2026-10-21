@@ -18,14 +18,37 @@ function webauthn_gate(): void {
 	}
 
 	phpsession_begin();
-	$user = webauthn_normalize_username($_SESSION['Username'] ?? '');
+	$changed = false;
+	/*
+	 * A password login on this request starts a new login: it must pass
+	 * the passkey step itself. The failure count is kept, so signing in
+	 * again cannot reset it and hide failed attempts.
+	 */
+	if (webauthn_is_login_post() && isset($_SESSION['webauthn'])) {
+		unset($_SESSION['webauthn']);
+		$changed = true;
+	}
+	$typed = webauthn_normalize_username($_SESSION['Username'] ?? '');
+	$user = webauthn_session_identity($_SESSION);
 	$state = $_SESSION['webauthn'] ?? null;
 	$source = webauthn_request_source($_SERVER, $settings);
 	$decision = webauthn_session_status($settings, $_SESSION, $source);
 
 	if ($decision == 'verified') {
-		phpsession_end();
+		phpsession_end($changed);
 		return;
+	}
+
+	if ($user === '') {
+		/* A local sign-in name that matches no account: fail closed. */
+		webauthn_log(LOG_WARNING, "user '{$typed}' does not resolve to a local account; access refused", $source);
+		unset($_SESSION['webauthn'], $_SESSION['page-match']);
+		phpsession_end(true);
+		webauthn_render_gate_page('deny', $settings, null, '');
+		exit;
+	}
+	if ($user !== $typed) {
+		webauthn_log(LOG_WARNING, "sign-in name '{$typed}' resolves to local account '{$user}'; its passkeys apply", $source);
 	}
 
 	if ($decision == 'revoked') {
@@ -41,7 +64,7 @@ function webauthn_gate(): void {
 			    ($method == 'trusted-network' ? 'trusted network' : 'no registered passkey and enforcement off') . ")", $source);
 			phpsession_end(true);
 		} else {
-			phpsession_end();
+			phpsession_end($changed);
 		}
 		return;
 	}
@@ -88,7 +111,7 @@ function webauthn_gate(): void {
 		$result = webauthn_gate_check_assertion($user, $settings);
 		if (is_array($result)) {
 			session_regenerate_id(true);
-			$_SESSION['webauthn'] = ['user' => $user, 'method' => 'webauthn', 'credential' => $result['id'], 'time' => time()];
+			$_SESSION['webauthn'] = webauthn_verified_state($user, $result, !empty($result['uv']), $settings);
 			unset($_SESSION['webauthn_failures']);
 			webauthn_log(LOG_NOTICE, "user '{$user}' verified with passkey", $source);
 			phpsession_end(true);
@@ -100,8 +123,8 @@ function webauthn_gate(): void {
 		webauthn_log(LOG_WARNING, "passkey verification failed for user '{$user}' ({$failures}/" . WEBAUTHN_MAX_FAILURES . "): {$result}", $source);
 		if ($failures >= WEBAUTHN_MAX_FAILURES) {
 			webauthn_log(LOG_WARNING, "too many passkey failures for user '{$user}'; session ended", $source);
-			webauthn_notice(sprintf('%d failed passkey attempts for user %s from %s after a correct password. ' .
-			    'If this was not you, change the password.', $failures, $user, $source['client']));
+			webauthn_notice(sprintf('%d failed passkey attempts for user "%s" from %s after a correct password. ' .
+			    'If this was not you, change the password.', $failures, webauthn_plain($user), $source['client']), 'failures:' . $user);
 			webauthn_gate_logout();
 		}
 		$error = gettext('Passkey verification failed. Try again.');
@@ -127,34 +150,35 @@ function webauthn_gate(): void {
 	exit;
 }
 
-/* Returns the verified credential on success, or an error string. Session must be open. */
+/*
+ * Returns the verified credential (with 'uv' => bool) on success, or an
+ * error string. Session must be open. The challenge counts as used only
+ * if the whole check succeeds (see webauthn_use_challenge()).
+ */
 function webauthn_gate_check_assertion(string $user, array $settings) {
 	try {
 		$client_data = webauthn_b64url_decode((string)($_POST['client_data'] ?? ''));
-		$challenge = webauthn_take_challenge('login', $user, $client_data);
-		if ($challenge === null) {
-			return 'challenge invalid, expired or already used';
-		}
+		$authenticator_data = webauthn_b64url_decode((string)($_POST['authenticator_data'] ?? ''));
+		$signature = webauthn_b64url_decode((string)($_POST['signature'] ?? ''));
 		$id = (string)($_POST['credential_id'] ?? '');
-		$cred = webauthn_find_credential($user, $id);
-		if ($cred === null) {
-			return 'unknown credential';
-		}
-		if (($cred['rp_id'] ?? '') !== webauthn_rp_id($settings)) {
-			return 'credential was registered for RP ID ' . ($cred['rp_id'] ?? '?');
-		}
-		$count = webauthn_verify_assertion(
-			$cred,
-			$client_data,
-			webauthn_b64url_decode((string)($_POST['authenticator_data'] ?? '')),
-			webauthn_b64url_decode((string)($_POST['signature'] ?? '')),
-			$challenge,
-			webauthn_rp_id($settings),
-			webauthn_allowed_origins($settings),
-			webauthn_require_uv($settings)
-		);
-		webauthn_set_sign_count($cred['id'], $count);
-		return $cred;
+		$cred = webauthn_use_challenge('login', $user, $client_data,
+		    function ($challenge) use ($user, $settings, $client_data, $authenticator_data, $signature, $id) {
+			$cred = webauthn_find_credential($user, $id);
+			if ($cred === null) {
+				throw new WebAuthnException('unknown credential');
+			}
+			if (($cred['rp_id'] ?? '') !== webauthn_rp_id($settings)) {
+				throw new WebAuthnException('credential was registered for RP ID ' . ($cred['rp_id'] ?? '?'));
+			}
+			$count = webauthn_verify_assertion($cred, $client_data, $authenticator_data, $signature, $challenge,
+			    webauthn_rp_id($settings), webauthn_allowed_origins($settings), webauthn_require_uv($settings), $info);
+			if (!webauthn_advance_sign_count($cred['id'], $count)) {
+				throw new WebAuthnException('Signature counter did not increase or could not be stored; the authenticator may be cloned');
+			}
+			$cred['uv'] = !empty($info['uv']);
+			return $cred;
+		});
+		return is_array($cred) ? $cred : 'challenge invalid, expired or already used';
 	} catch (WebAuthnException $e) {
 		return $e->getMessage();
 	}
@@ -184,7 +208,8 @@ function webauthn_render_gate_page(string $mode, array $settings, ?array $option
 	$origins = webauthn_allowed_origins($settings);
 	$logincss = '#1e3f75';
 	$user_settings = get_user_settings('');
-	if (isset($user_settings['webgui']['logincss']) && strlen($user_settings['webgui']['logincss']) == 6) {
+	if (isset($user_settings['webgui']['logincss']) && strlen($user_settings['webgui']['logincss']) == 6 &&
+	    ctype_xdigit($user_settings['webgui']['logincss'])) {
 		$logincss = '#' . $user_settings['webgui']['logincss'];
 	}
 	header('Cache-Control: no-cache, no-store, must-revalidate');
@@ -275,9 +300,13 @@ function webauthn_cached_privileges_allowed(): bool {
 	if (empty($settings['enable'])) {
 		return true;
 	}
+	if (webauthn_is_login_post()) {
+		/* A password login goes through authgui.inc and the gate. */
+		return false;
+	}
 	@phpsession_begin();
 	$session = is_array($_SESSION ?? null) ? $_SESSION : [];
-	@phpsession_end();
 	$status = webauthn_session_status($settings, $session, webauthn_request_source($_SERVER, $settings));
+	@phpsession_end();
 	return in_array($status, ['verified', 'skip'], true);
 }

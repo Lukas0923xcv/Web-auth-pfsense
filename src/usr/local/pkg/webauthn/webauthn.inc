@@ -28,8 +28,26 @@ if (!defined('WEBAUTHN_USED_FILE')) {
 	/* Kept on disk: losing the list (e.g. at reboot) would make used challenges valid again. */
 	define('WEBAUTHN_USED_FILE', '/conf/webauthn_used_challenges.json');
 }
+if (!defined('WEBAUTHN_REVOKED_FILE')) {
+	/* IDs of removed passkeys: never accepted again, even if a config
+	 * restore or a stale write brings the record back. */
+	define('WEBAUTHN_REVOKED_FILE', '/conf/webauthn_revoked.json');
+}
+if (!defined('WEBAUTHN_CONFIG_LOCK')) {
+	/* Serialises changes to installedpackages/webauthn (".lock" is appended). */
+	define('WEBAUTHN_CONFIG_LOCK', '/conf/webauthn_config');
+}
+if (!defined('WEBAUTHN_NOTICE_FILE')) {
+	define('WEBAUTHN_NOTICE_FILE', '/conf/webauthn_notices.json');
+}
 define('WEBAUTHN_MAX_FAILURES', 5);
 define('WEBAUTHN_CHALLENGE_TTL', 300);
+/* A passkey verification is good for this long at most (seconds). */
+define('WEBAUTHN_VERIFIED_MAX_AGE', 12 * 3600);
+/* Upper bound for unexpired entries in the used-challenge list. */
+define('WEBAUTHN_MAX_LIVE_NONCES', 10000);
+/* At most one failed-attempt notice per user in this many seconds. */
+define('WEBAUTHN_NOTICE_INTERVAL', 900);
 
 function webauthn_default_settings(): array {
 	return [
@@ -66,19 +84,37 @@ function webauthn_normalize_username(?string $username): string {
 }
 
 /*
+ * Can usernames be compared the way directories do? That needs PHP's intl
+ * (Normalizer) and mbstring extensions. $set overrides the answer (tests).
+ */
+function webauthn_unicode_available(?bool $set = null): bool {
+	static $override = null;
+	if ($set !== null) {
+		$override = $set;
+	}
+	return $override ?? (class_exists('Normalizer') && function_exists('mb_convert_case') && function_exists('mb_convert_kana'));
+}
+
+/*
  * A username the way directories compare names (RFC 4518): compatibility
  * forms (NFKC), no soft hyphens, zero-width or other ignorable characters,
- * runs of spaces collapsed, case folded.
+ * runs of spaces collapsed, case folded, katakana as hiragana (Active
+ * Directory ignores the kana type). Without intl/mbstring only ASCII is
+ * folded; webauthn_session_has_credentials() then fails closed.
  */
 function webauthn_username_fold(?string $username): string {
 	$u = (string)$username;
-	if (class_exists('Normalizer')) {
+	$unicode = webauthn_unicode_available();
+	if ($unicode) {
 		$n = Normalizer::normalize($u, Normalizer::FORM_KC);
 		$u = ($n === false) ? $u : $n;
 	}
 	$u = preg_replace('/[\p{Cf}\p{Cc}\x{034F}\x{1806}\x{180B}-\x{180D}\x{FE00}-\x{FE0F}\x{FFFC}]/u', '', $u) ?? $u;
 	$u = trim(preg_replace('/[\p{Z}\s]+/u', ' ', $u) ?? $u);
-	return function_exists('mb_convert_case') ? mb_convert_case($u, MB_CASE_FOLD, 'UTF-8') : strtolower($u);
+	if (!$unicode) {
+		return strtolower($u);
+	}
+	return mb_convert_kana(mb_convert_case($u, MB_CASE_FOLD, 'UTF-8'), 'c', 'UTF-8');
 }
 
 /*
@@ -86,7 +122,7 @@ function webauthn_username_fold(?string $username): string {
  * mean, used only to stop other spellings of a remote (LDAP/RADIUS)
  * account from skipping the passkey step. pfSense's LDAP code keeps the
  * part before "@" and before "\"; RADIUS servers usually strip a realm
- * ("user@realm", "REALM\user", "realm/user"). So "admin@x", "admin\x",
+ * ("user@realm", "user%realm", "REALM\user", "realm/user"). So "admin@x", "admin\x",
  * "CORP\admin" and "ADMIN" can all sign in as "admin".
  *
  * $login: the name typed at sign-in. Only for it is the part before "\"
@@ -109,7 +145,8 @@ function webauthn_username_keys(?string $username, bool $login): array {
 	$keys = [];
 	foreach ($parts as $p) {
 		$keys[] = trim($p);
-		$keys[] = trim(explode('@', $p, 2)[0]);
+		/* "user@realm" and "user%realm" */
+		$keys[] = trim(preg_split('/[@%]/', $p, 2)[0]);
 	}
 	return array_values(array_unique(array_filter($keys, 'strlen')));
 }
@@ -120,6 +157,52 @@ function webauthn_username_keys(?string $username, bool $login): array {
  */
 function webauthn_session_is_local(array $session): bool {
 	return in_array($session['authsource'] ?? null, ['Local Database', 'Local Database Fallback'], true);
+}
+
+/*
+ * The local account named $name, or null. pfSense's getUserEntry() looks
+ * names up through an array index; PHP turns only canonical decimal
+ * strings into integer keys, so that lookup is an exact string match,
+ * which this repeats without depending on auth.inc being loaded. With
+ * duplicate names the last entry wins, as in pfSense's index.
+ */
+function webauthn_local_user(string $name): ?array {
+	$found = null;
+	foreach (config_get_path('system/user', []) as $u) {
+		if (is_array($u) && isset($u['name']) && (string)$u['name'] === $name) {
+			$found = $u;
+		}
+	}
+	return $found;
+}
+
+/*
+ * The account a session belongs to, as passkey owner. For local accounts
+ * it is the name the user database resolves the sign-in name to, and ''
+ * when it resolves to none: such a session has to pass the passkey step
+ * and cannot (fail closed). Remote accounts keep the sign-in name.
+ */
+function webauthn_session_identity(array $session): string {
+	$typed = webauthn_normalize_username($session['Username'] ?? '');
+	if ($typed === '' || !webauthn_session_is_local($session)) {
+		return $typed;
+	}
+	$entry = webauthn_local_user($typed);
+	return is_array($entry) ? webauthn_normalize_username((string)$entry['name']) : '';
+}
+
+/* The PHP session ID a verification is bound to. */
+function webauthn_session_sid(): string {
+	$sid = session_id();
+	if ($sid === '' || $sid === false) {
+		$sid = (string)($_COOKIE[session_name()] ?? '');
+	}
+	return (string)$sid;
+}
+
+/* Is this request a password sign-in (pfSense's login form)? */
+function webauthn_is_login_post(): bool {
+	return isset($_POST['login']) && isset($_POST['usernamefld']);
 }
 
 /* Passkeys registered under another spelling of the sign-in name $username (see webauthn_username_keys()). */
@@ -177,6 +260,16 @@ function webauthn_ip_in_list(string $ip, array $list): bool {
 		}
 	}
 	return false;
+}
+
+/* Is the prefix shorter than /8 (IPv4) or /16 (IPv6)? */
+function webauthn_cidr_too_large(string $cidr): bool {
+	$parts = explode('/', $cidr, 2);
+	if (!isset($parts[1]) || !ctype_digit($parts[1])) {
+		return false;
+	}
+	$bin = @inet_pton($parts[0]);
+	return (int)$parts[1] < (($bin !== false && strlen($bin) == 16) ? 16 : 8);
 }
 
 function webauthn_valid_cidr(string $cidr): bool {
@@ -261,43 +354,92 @@ function webauthn_gate_decision(array $settings, array $source, bool $has_creden
 /*
  * Where a GUI session stands with respect to the second factor.
  *   'disabled'  - the second factor is off
- *   'verified'  - passed WebAuthn with a passkey that is still registered
+ *   'verified'  - passed WebAuthn in this login, recently enough, with a
+ *                 passkey that is still registered, for the current RP ID
+ *                 and user verification setting
+ *   'revoked'   - passed WebAuthn with a passkey that has been removed
  *   'skip'      - exempt for this request (trusted network, or no passkey
  *                 while enforcement is off)
  *   'require'   - must pass WebAuthn now
  *   'deny'      - no passkey and enforcement is on
- * $session is $_SESSION. Removing a passkey revokes the sessions it
- * verified, because 'verified' re-checks that the passkey still exists.
+ * $session is $_SESSION.
  */
 function webauthn_session_status(array $settings, array $session, array $source): string {
 	if (empty($settings['enable'])) {
 		return 'disabled';
 	}
-	$user = webauthn_normalize_username($session['Username'] ?? '');
+	$user = webauthn_session_identity($session);
 	if ($user === '') {
 		return 'require';
 	}
 	$state = $session['webauthn'] ?? null;
 	if (is_array($state) && ($state['method'] ?? null) === 'webauthn' &&
 	    webauthn_normalize_username($state['user'] ?? '') === $user) {
-		if (is_string($state['credential'] ?? null) && webauthn_find_credential($user, $state['credential']) !== null) {
+		if (!is_string($state['credential'] ?? null) || webauthn_find_credential($user, $state['credential']) === null) {
+			/* Its passkey was removed: the session ends, even if the user
+			 * has no passkey left and would otherwise skip the step. */
+			return 'revoked';
+		}
+		if (webauthn_verified_state_valid($state, $settings)) {
 			return 'verified';
 		}
-		/* Its passkey was removed: the session ends, even if the user has
-		 * no passkey left and would otherwise skip the step. */
-		return 'revoked';
+		/* From another login, too old, or weaker than the settings now
+		 * ask for: decide as for a session that never verified. */
 	}
-	return webauthn_gate_decision($settings, $source, webauthn_session_has_credentials($session));
+	$status = webauthn_gate_decision($settings, $source, webauthn_session_has_credentials($session));
+	if ($status === 'skip' && webauthn_session_is_local($session) &&
+	    $user !== webauthn_normalize_username($session['Username'] ?? '') &&
+	    !webauthn_source_is_trusted_network($source, $settings)) {
+		/* The sign-in name is not the account name it resolved to. */
+		return 'require';
+	}
+	return $status;
+}
+
+/*
+ * Is a stored passkey verification still good? It must belong to this
+ * PHP session (pfSense gives every password sign-in a new session ID, so
+ * a new sign-in never inherits it), be at most WEBAUTHN_VERIFIED_MAX_AGE
+ * old, and match the current RP ID and user verification setting.
+ */
+function webauthn_verified_state_valid(array $state, array $settings): bool {
+	$time = (int)($state['time'] ?? 0);
+	$now = time();
+	return is_string($state['sid'] ?? null) && hash_equals($state['sid'], webauthn_session_sid()) &&
+	    $time > 0 && $time <= $now && $now - $time <= WEBAUTHN_VERIFIED_MAX_AGE &&
+	    ($state['rp_id'] ?? null) === webauthn_rp_id($settings) &&
+	    (!webauthn_require_uv($settings) || !empty($state['uv']));
+}
+
+/* The session state recorded after a successful passkey verification. Call after session_regenerate_id(). */
+function webauthn_verified_state(string $user, array $cred, bool $uv, array $settings): array {
+	return ['user' => $user, 'method' => 'webauthn', 'credential' => (string)$cred['id'], 'time' => time(),
+	    'sid' => webauthn_session_sid(), 'rp_id' => webauthn_rp_id($settings), 'uv' => $uv];
 }
 
 /*
  * Does the session's user have passkeys? For remote accounts, another
- * spelling with passkeys counts too: it must not skip the step.
+ * spelling with passkeys counts too: it must not skip the step. Without
+ * intl/mbstring other spellings cannot be recognised reliably, so then
+ * any passkey at all counts for remote accounts (fail closed).
  */
 function webauthn_session_has_credentials(array $session): bool {
-	$user = webauthn_normalize_username($session['Username'] ?? '');
-	return !empty(webauthn_get_credentials($user)) ||
-	    (!webauthn_session_is_local($session) && !empty(webauthn_case_variant_credentials($user)));
+	$user = webauthn_session_identity($session);
+	if (!empty(webauthn_get_credentials($user))) {
+		return true;
+	}
+	if (webauthn_session_is_local($session)) {
+		return false;
+	}
+	if (!webauthn_unicode_available()) {
+		static $warned = false;
+		if (!$warned) {
+			$warned = true;
+			webauthn_log(LOG_WARNING, 'PHP intl/mbstring missing: every passkey counts for every LDAP/RADIUS user');
+		}
+		return !empty(webauthn_all_credentials());
+	}
+	return !empty(webauthn_case_variant_credentials($user));
 }
 
 /*
@@ -305,11 +447,31 @@ function webauthn_session_has_credentials(array $session): bool {
  * accounts, another spelling of it) has a passkey, only a session that
  * signed in with one may add another. Otherwise a password alone, from a
  * trusted network or while enforcement is off, would be enough to enrol
- * an attacker's passkey for later use through the tunnel.
+ * an attacker's passkey for later use through the tunnel. While the
+ * second factor is off nobody is verified, so then only an admin may.
  */
-function webauthn_may_register(array $settings, array $session, array $source): bool {
-	return !webauthn_session_has_credentials($session) ||
-	    in_array(webauthn_session_status($settings, $session, $source), ['disabled', 'verified'], true);
+function webauthn_may_register(array $settings, array $session, array $source, bool $is_admin = false): bool {
+	if (!webauthn_session_has_credentials($session)) {
+		return true;
+	}
+	$status = webauthn_session_status($settings, $session, $source);
+	return $status === 'verified' || ($status === 'disabled' && $is_admin);
+}
+
+/*
+ * May this session remove passkey $id? Admins may always (the recovery
+ * path from a trusted network). Other users may not remove their last
+ * passkey without a session verified with a passkey: a password alone
+ * would otherwise switch the passkey step off for the account.
+ */
+function webauthn_may_delete(array $settings, array $session, array $source, string $id, bool $is_admin): bool {
+	if ($is_admin) {
+		return true;
+	}
+	$left = array_filter(webauthn_get_credentials(webauthn_session_identity($session)), function ($c) use ($id) {
+		return ($c['id'] ?? null) !== $id;
+	});
+	return !empty($left) || webauthn_session_status($settings, $session, $source) === 'verified';
 }
 
 function webauthn_rp_id(?array $settings = null): string {
@@ -362,19 +524,15 @@ function webauthn_validate_settings(array $s): array {
 		}
 	}
 	/* A cloudflared address inside a trusted network is fine (tunnel
-	 * traffic is never exempt), but a /0 entry (however written, e.g. /00)
-	 * would exempt everyone. */
+	 * traffic is never exempt), but a huge network (however written, e.g.
+	 * /00) would exempt or admit a large part of the Internet. */
 	$trusted = webauthn_split_list($s['trusted_networks'] ?? '');
-	foreach ($trusted as $c) {
-		$parts = explode('/', $c, 2);
-		if (isset($parts[1]) && ctype_digit($parts[1]) && (int)$parts[1] === 0) {
-			$errors[] = gettext('A /0 trusted network would disable WebAuthn for everyone.');
-		}
-	}
-	foreach (webauthn_split_list($s['xmlrpc_peers'] ?? '') as $c) {
-		$parts = explode('/', $c, 2);
-		if (isset($parts[1]) && ctype_digit($parts[1]) && (int)$parts[1] === 0) {
-			$errors[] = gettext('A /0 XMLRPC peer would let every host use XMLRPC with a password alone.');
+	foreach (['trusted_networks' => gettext('Trusted network'), 'xmlrpc_peers' => gettext('XMLRPC peer')] as $field => $label) {
+		foreach (webauthn_split_list($s[$field] ?? '') as $c) {
+			if (webauthn_valid_cidr($c) && webauthn_cidr_too_large($c)) {
+				$errors[] = sprintf(gettext('%1$s entry %2$s is too large: use at least /8 for IPv4 and /16 for IPv6.'),
+				    $label, htmlspecialchars($c));
+			}
 		}
 	}
 	/* Without the cloudflared address, tunnel traffic from a LAN host is
@@ -386,6 +544,24 @@ function webauthn_validate_settings(array $s): array {
 		$errors[] = gettext('Invalid user verification setting.');
 	}
 	return $errors;
+}
+
+/*
+ * Would saving $new lock out the admin saving it, from where they are
+ * ($source, under the new settings), given their passkeys $mine? Returns
+ * the error message, or null.
+ */
+function webauthn_settings_lockout_error(array $new, array $source, array $mine): ?string {
+	if (empty($new['enable']) || webauthn_source_is_trusted_network($source, $new)) {
+		return null;
+	}
+	if (webauthn_gate_decision($new, $source, !empty($mine)) == 'deny') {
+		return gettext('These settings would lock you out of this session: register a passkey for your account, or save from a trusted network.');
+	}
+	if (!empty($mine) && !in_array(webauthn_rp_id($new), array_column($mine, 'rp_id'), true)) {
+		return gettext('None of your passkeys was registered for this RP ID, so you could not sign in again: save from a trusted network, or keep the RP ID.');
+	}
+	return null;
 }
 
 /*
@@ -406,24 +582,80 @@ function webauthn_log(int $level, string $message, ?array $source = null): void 
 }
 
 /*
+ * $s as one line of plain text for notices, notification e-mails and
+ * config history: no control, format (e.g. bidi override) or line/paragraph
+ * separator characters, valid UTF-8, at most $max characters. Login names
+ * from LDAP/RADIUS can carry arbitrary text after "@".
+ */
+function webauthn_plain(string $s, int $max = 64): string {
+	if (function_exists('mb_check_encoding') ? !mb_check_encoding($s, 'UTF-8') : !preg_match('//u', $s)) {
+		$s = function_exists('mb_scrub') ? mb_scrub($s, 'UTF-8') : preg_replace('/[\x80-\xff]/', '?', $s);
+	}
+	$s = preg_replace('/[\x00-\x1f\x7f]/', ' ', $s);
+	$s = preg_replace('/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u', ' ', $s) ?? preg_replace('/[\x80-\xff]/', '?', $s);
+	if (function_exists('mb_strlen') && mb_strlen($s, 'UTF-8') > $max) {
+		$s = mb_substr($s, 0, $max, 'UTF-8') . '…';
+	} elseif (!function_exists('mb_strlen') && strlen($s) > $max) {
+		$s = substr($s, 0, $max) . '...';
+	}
+	return $s;
+}
+
+/*
  * Raise a GUI notice (the bell icon; also sent through any configured
  * notification channels such as e-mail) for security-relevant events.
+ * Callers quote user-supplied names ("%s"). pfSense escapes notices for
+ * HTML itself (file_notice() and head.inc), so this only makes the text
+ * plain. With $rate_key, at most one notice per key is raised in
+ * WEBAUTHN_NOTICE_INTERVAL seconds.
  */
-function webauthn_notice(string $message): void {
+function webauthn_notice(string $message, ?string $rate_key = null): void {
+	if ($rate_key !== null && !webauthn_notice_due($rate_key)) {
+		return;
+	}
 	if (!function_exists('file_notice')) {
 		@include_once('notices.inc');
 	}
 	if (function_exists('file_notice')) {
-		file_notice('webauthn', $message, 'WebAuthn');
+		file_notice('webauthn', webauthn_plain($message, 400), 'WebAuthn');
 	}
+}
+
+/* Record that a notice for $key is raised now; false if one was raised recently. */
+function webauthn_notice_due(string $key): bool {
+	return webauthn_with_lock(WEBAUTHN_NOTICE_FILE, function () use ($key) {
+		$now = time();
+		$data = json_decode((string)@file_get_contents(WEBAUTHN_NOTICE_FILE), true);
+		$data = is_array($data) ? $data : [];
+		$data = array_filter($data, function ($t) use ($now) {
+			return is_int($t) && $t > $now - WEBAUTHN_NOTICE_INTERVAL;
+		});
+		$k = hash('sha256', $key);
+		if (isset($data[$k])) {
+			return false;
+		}
+		$data[$k] = $now;
+		webauthn_write_json(WEBAUTHN_NOTICE_FILE, $data);
+		return true;
+	}, true);
+}
+
+/*
+ * Is $name acceptable as a passkey name? Letters, digits, spaces and
+ * . _ ( ) - only, 1 to 64 characters, valid UTF-8: config.xml must stay
+ * readable (pfSense writes control characters into it unchanged, which
+ * makes the file invalid XML).
+ */
+function webauthn_valid_passkey_name(string $name): bool {
+	return preg_match('//u', $name) === 1 && preg_match('/^[\p{L}\p{N} ._()\-]{1,64}$/u', $name) === 1;
 }
 
 /* ---- Credential storage ---- */
 
 /*
- * All stored credentials as a list. <item> is a pfSense list tag, so it
- * always parses as a list; wrap a bare element anyway in case one was
- * written by hand.
+ * All stored credentials as a list, without revoked ones. <item> is a
+ * pfSense list tag, so it always parses as a list; wrap a bare element
+ * anyway in case one was written by hand.
  */
 function webauthn_all_credentials(): array {
 	$all = config_get_path(WEBAUTHN_CRED_PATH, []);
@@ -433,48 +665,229 @@ function webauthn_all_credentials(): array {
 	if (isset($all['id']) && !is_array($all['id'])) {
 		$all = [$all];
 	}
-	return array_values(array_filter($all, 'is_array'));
+	/* A damaged list still lets every passkey count as present (no skipping); webauthn_find_credential() then refuses them all. */
+	$revoked = webauthn_revoked_ids() ?? [];
+	return array_values(array_filter($all, function ($c) use ($revoked) {
+		return is_array($c) && !isset($revoked[(string)($c['id'] ?? '')]);
+	}));
 }
 
+/*
+ * Credentials of $username (all if null). Passkeys registered by a local
+ * account record its uid; once that account is deleted and a new one
+ * gets the same name, they no longer count (see webauthn_orphaned()).
+ */
 function webauthn_get_credentials(?string $username = null): array {
 	$out = [];
 	foreach (webauthn_all_credentials() as $c) {
-		if ($username === null || webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username)) {
+		if ($username === null || (webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username) &&
+		    !webauthn_orphaned($c))) {
 			$out[] = $c;
 		}
 	}
 	return $out;
 }
 
-function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id): void {
-	$all = webauthn_all_credentials();
-	$all[] = [
-		'username' => webauthn_normalize_username($username),
-		'name' => $name,
-		'id' => webauthn_b64url_encode($reg['credential_id']),
-		'alg' => (string)$reg['alg'],
-		'publickey' => base64_encode($reg['pem']),
-		'rp_id' => $rp_id,
-		'created' => (string)time(),
-	];
-	config_set_path(WEBAUTHN_CRED_PATH, $all);
-	write_config(sprintf('WebAuthn: registered passkey "%s" for user %s', $name, $username));
-	webauthn_set_sign_count($all[count($all) - 1]['id'], (int)$reg['sign_count']);
+/* Was $c registered by a local account that no longer exists (same name, other uid, or gone)? */
+function webauthn_orphaned(array $c): bool {
+	if (!isset($c['uid']) || $c['uid'] === '') {
+		return false;
+	}
+	$u = webauthn_local_user(webauthn_normalize_username($c['username'] ?? ''));
+	return !is_array($u) || (string)($u['uid'] ?? '') !== (string)$c['uid'];
 }
 
-/* Delete a credential; restrict to $username unless null (admin). */
+/*
+ * Change installedpackages/webauthn safely: under our own lock, on the
+ * configuration as it is on disk now (pfSense keeps the config as it was
+ * when the request started, and write_config() writes all of it, so a
+ * change made by a parallel request would otherwise be undone). $change
+ * returns false to abort. pfSense's own config lock (/tmp/config.lock) is
+ * a different file, taken inside write_config(): no deadlock.
+ */
+function webauthn_config_update(callable $change, string $desc): bool {
+	return webauthn_with_lock(WEBAUTHN_CONFIG_LOCK, function () use ($change, $desc) {
+		if (!webauthn_config_reload() || $change() === false) {
+			return false;
+		}
+		return is_array(write_config(webauthn_plain($desc, 200)));
+	}, false);
+}
+
+/*
+ * Reload config.xml into memory. Newer pfSense has config_read_file();
+ * older versions (2.7.x) only parse_config(), which can die() or restore
+ * a backup, so there config.xml is parsed directly. False (abort the
+ * change) if the file cannot be read.
+ */
+function webauthn_config_reload(): bool {
+	if (function_exists('config_read_file')) {
+		return config_read_file(false, false);
+	}
+	if (!function_exists('parse_xml_config') || !function_exists('g_get')) {
+		return false;
+	}
+	$parsed = parse_xml_config(g_get('conf_path') . '/config.xml', [g_get('xml_rootobj')]);
+	if (!is_array($parsed) || empty($parsed)) {
+		return false;
+	}
+	$GLOBALS['config'] = $parsed;
+	return true;
+}
+
+/*
+ * Store a new passkey. Returns null on success, or an error message.
+ * $uid: the pfSense uid of a local account, '' for remote accounts.
+ */
+function webauthn_add_credential(string $username, string $name, array $reg, string $rp_id, string $uid = ''): ?string {
+	$id = webauthn_b64url_encode($reg['credential_id']);
+	$error = null;
+	$ok = webauthn_config_update(function () use ($username, $name, $reg, $rp_id, $uid, $id, &$error) {
+		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
+		$all = is_array($all) ? array_values(array_filter(isset($all['id']) && !is_array($all['id']) ? [$all] : $all, 'is_array')) : [];
+		$revoked = webauthn_revoked_ids();
+		if ($revoked === null) {
+			$error = gettext('The list of removed passkeys is damaged; see the system log.');
+			return false;
+		}
+		foreach ($all as $i => $c) {
+			if (($c['id'] ?? null) === $id) {
+				if (!isset($revoked[$id])) {
+					$error = gettext('This passkey is already registered.');
+					return false;
+				}
+				/* A revoked record brought back (e.g. by a restore) is replaced. */
+				unset($all[$i]);
+			}
+		}
+		$all = array_values($all);
+		/* Stored before the passkey becomes usable: a counter that cannot
+		 * be kept would make clone detection meaningless. */
+		if (!webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $reg) {
+			$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
+			$data = is_array($data) ? $data : [];
+			$data[$id] = (int)$reg['sign_count'];
+			return webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
+		})) {
+			$error = gettext('The signature counter could not be stored.');
+			return false;
+		}
+		webauthn_unrevoke($id);
+		$rec = [
+			'username' => webauthn_normalize_username($username),
+			'name' => $name,
+			'id' => $id,
+			'alg' => (string)$reg['alg'],
+			'publickey' => base64_encode($reg['pem']),
+			'rp_id' => $rp_id,
+			'created' => (string)time(),
+		];
+		if ($uid !== '') {
+			$rec['uid'] = $uid;
+		}
+		$all[] = $rec;
+		config_set_path(WEBAUTHN_CRED_PATH, $all);
+	}, sprintf('WebAuthn: registered passkey "%s" for user "%s"', webauthn_plain($name), webauthn_plain($username)));
+	if (!$ok) {
+		return $error ?? gettext('The configuration could not be saved.');
+	}
+	return null;
+}
+
+/*
+ * Delete a credential; restrict to $username unless null (admin). Every
+ * record with that ID goes, and the ID is revoked first, so it is never
+ * accepted again even if the change cannot be saved or a config restore
+ * brings it back. True only if the change was saved and the ID is gone.
+ */
 function webauthn_delete_credential(string $id, ?string $username = null): bool {
-	$all = webauthn_all_credentials();
-	foreach ($all as $i => $c) {
-		if (($c['id'] ?? null) === $id && ($username === null ||
-		    webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username))) {
-			unset($all[$i]);
-			config_set_path(WEBAUTHN_CRED_PATH, array_values($all));
-			write_config(sprintf('WebAuthn: removed passkey "%s" of user %s', $c['name'] ?? '', $c['username'] ?? ''));
-			return true;
+	$match = function ($c) use ($id, $username) {
+		return is_array($c) && ($c['id'] ?? null) === $id && ($username === null ||
+		    webauthn_normalize_username($c['username'] ?? '') === webauthn_normalize_username($username));
+	};
+	if (empty(array_filter(webauthn_all_credentials(), $match))) {
+		return false;
+	}
+	if (!webauthn_revoke($id)) {
+		return false;
+	}
+	$names = [];
+	$ok = webauthn_config_update(function () use ($match, &$names) {
+		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
+		$all = is_array($all) ? (isset($all['id']) && !is_array($all['id']) ? [$all] : $all) : [];
+		$keep = [];
+		foreach ($all as $c) {
+			if ($match($c)) {
+				$names[] = sprintf('"%s" of user "%s"', webauthn_plain((string)($c['name'] ?? '')), webauthn_plain((string)($c['username'] ?? '')));
+			} elseif (is_array($c)) {
+				$keep[] = $c;
+			}
+		}
+		config_set_path(WEBAUTHN_CRED_PATH, $keep);
+	}, 'WebAuthn: removed passkey ' . substr($id, 0, 16));
+	if (!$ok || !webauthn_config_reload()) {
+		return false;
+	}
+	foreach ((array)config_get_path(WEBAUTHN_CRED_PATH, []) as $c) {
+		if (is_array($c) && ($c['id'] ?? null) === $id) {
+			return false;
 		}
 	}
-	return false;
+	webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id) {
+		$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
+		if (is_array($data) && isset($data[$id])) {
+			unset($data[$id]);
+			webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
+		}
+	});
+	return true;
+}
+
+/* Save the settings under the config lock. */
+function webauthn_save_settings(array $new): bool {
+	return webauthn_config_update(function () use ($new) {
+		config_set_path(WEBAUTHN_CONFIG_PATH, $new);
+	}, gettext('WebAuthn: settings changed'));
+}
+
+/*
+ * Revoked credential IDs as a set (id => time); null if the file exists
+ * but cannot be read as such (it is only ever replaced whole, so this
+ * means outside damage): then no passkey is accepted (fail closed).
+ */
+function webauthn_revoked_ids(): ?array {
+	$raw = @file_get_contents(WEBAUTHN_REVOKED_FILE);
+	if ($raw === false) {
+		return file_exists(WEBAUTHN_REVOKED_FILE) ? null : [];
+	}
+	$data = json_decode($raw, true);
+	return is_array($data) ? $data : null;
+}
+
+function webauthn_revoke(string $id): bool {
+	return webauthn_with_lock(WEBAUTHN_REVOKED_FILE, function () use ($id) {
+		$data = webauthn_revoked_ids();
+		if ($data === null) {
+			return false;
+		}
+		$data[$id] = time();
+		return webauthn_write_json(WEBAUTHN_REVOKED_FILE, $data);
+	});
+}
+
+/* Registering the same credential ID again makes it valid again (authenticators normally create new IDs). */
+function webauthn_unrevoke(string $id): bool {
+	return webauthn_with_lock(WEBAUTHN_REVOKED_FILE, function () use ($id) {
+		$data = webauthn_revoked_ids();
+		if ($data === null) {
+			return false;
+		}
+		if (!isset($data[$id])) {
+			return true;
+		}
+		unset($data[$id]);
+		return webauthn_write_json(WEBAUTHN_REVOKED_FILE, $data);
+	});
 }
 
 /*
@@ -486,13 +899,32 @@ function webauthn_get_sign_count(string $id): int {
 	return (int)($data[$id] ?? 0);
 }
 
-function webauthn_set_sign_count(string $id, int $count): void {
-	webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $count) {
+function webauthn_set_sign_count(string $id, int $count): bool {
+	return webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $count) {
 		$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
 		$data = is_array($data) ? $data : [];
 		$data[$id] = $count;
 		return webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
 	});
+}
+
+/*
+ * Atomically advance the counter; false if it did not increase or could
+ * not be stored. Comparing against the value on disk under the lock means
+ * two parallel assertions (a clone and the real key) cannot both pass
+ * and leave the counter lower than one of them reported.
+ */
+function webauthn_advance_sign_count(string $id, int $count): bool {
+	return webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $count) {
+		$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
+		$data = is_array($data) ? $data : [];
+		$stored = (int)($data[$id] ?? 0);
+		if (($count != 0 || $stored != 0) && $count <= $stored) {
+			return false;
+		}
+		$data[$id] = $count;
+		return webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
+	}, false);
 }
 
 /* Run $fn holding an exclusive lock on "$file.lock"; $fail if the lock cannot be taken. */
@@ -516,23 +948,41 @@ function webauthn_with_lock(string $file, callable $fn, $fail = false) {
 }
 
 /*
- * Replace $file with $data as JSON through a temp file and rename, so a
- * failed write (e.g. a full disk) never leaves a truncated file behind.
+ * Replace $file with $data as JSON through a temp file of this process
+ * and rename, so a failed write (e.g. a full disk) never leaves a
+ * truncated file behind. The file is mode 0600.
  */
 function webauthn_write_json(string $file, array $data): bool {
 	$json = json_encode($data);
-	$tmp = $file . '.tmp';
+	if (!is_string($json)) {
+		return false;
+	}
+	$tmp = $file . '.' . getmypid() . '.tmp';
+	@unlink($tmp);
 	$old = umask(077);
-	$ok = @file_put_contents($tmp, $json) === strlen($json) && @rename($tmp, $file);
+	$fp = @fopen($tmp, 'x');
 	umask($old);
+	$ok = $fp !== false && fwrite($fp, $json) === strlen($json);
+	if ($fp !== false) {
+		$ok = fclose($fp) && $ok;
+	}
+	$ok = $ok && @chmod($tmp, 0600) && @rename($tmp, $file);
 	if (!$ok) {
 		@unlink($tmp);
 	}
 	return $ok;
 }
 
-/* Find a stored credential for $username by its base64url ID. */
+/* Find a usable stored credential for $username by its base64url ID. */
 function webauthn_find_credential(string $username, string $id): ?array {
+	if (webauthn_revoked_ids() === null) {
+		static $logged = false;
+		if (!$logged) {
+			$logged = true;
+			webauthn_log(LOG_ERR, WEBAUTHN_REVOKED_FILE . ' is damaged: no passkey is accepted until it is repaired or removed');
+		}
+		return null;
+	}
 	foreach (webauthn_get_credentials($username) as $c) {
 		if (hash_equals((string)$c['id'], $id)) {
 			$c['pem'] = base64_decode($c['publickey']);
@@ -576,11 +1026,7 @@ function webauthn_hmac_key(): string {
 }
 
 function webauthn_challenge_mac(string $purpose, string $username, string $payload): string {
-	$sid = session_id();
-	if ($sid === '' || $sid === false) {
-		$sid = (string)($_COOKIE[session_name()] ?? '');
-	}
-	$data = implode("\0", [$purpose, $sid, webauthn_normalize_username($username), $payload]);
+	$data = implode("\0", [$purpose, webauthn_session_sid(), webauthn_normalize_username($username), $payload]);
 	return substr(hash_hmac('sha256', $data, webauthn_hmac_key(), true), 0, 16);
 }
 
@@ -590,12 +1036,12 @@ function webauthn_new_challenge(string $purpose, string $username): string {
 }
 
 /*
- * Validate the challenge the browser signed (taken from clientDataJSON)
- * and mark it used. Returns the raw challenge, or null if it is forged,
- * expired, for another session/user/purpose, or already used. The
- * ceremony verification then checks clientDataJSON against it again.
+ * Check the challenge the browser signed (taken from clientDataJSON):
+ * HMAC for this session, user and purpose, and expiry. Returns
+ * [challenge, nonce, expires] or null. A challenge expiring further ahead
+ * than a fresh one would (the clock went back) is refused too.
  */
-function webauthn_take_challenge(string $purpose, string $username, string $client_data_json): ?string {
+function webauthn_parse_challenge(string $purpose, string $username, string $client_data_json, int $now): ?array {
 	$cd = json_decode($client_data_json, true);
 	try {
 		$challenge = webauthn_b64url_decode((string)($cd['challenge'] ?? ''));
@@ -610,35 +1056,88 @@ function webauthn_take_challenge(string $purpose, string $username, string $clie
 		return null;
 	}
 	$expires = unpack('N', substr($payload, 16, 4))[1];
-	if ($expires < time()) {
+	if ($expires < $now || $expires > $now + WEBAUTHN_CHALLENGE_TTL) {
 		return null;
 	}
-	return webauthn_mark_nonce_used(bin2hex(substr($payload, 0, 16)), $expires) ? $challenge : null;
+	return [$challenge, bin2hex(substr($payload, 0, 16)), $expires];
+}
+
+/*
+ * Run $verify($challenge) for the challenge in clientDataJSON while
+ * holding the used-challenge lock, and record the challenge as used only
+ * if $verify returns (an exception aborts without recording it). So only
+ * completed ceremonies fill the list, which an attacker without a passkey
+ * therefore cannot fill, and one signed response is never accepted twice,
+ * not even by two parallel requests. Returns $verify's result, or null if
+ * the challenge is forged, expired, for another session/user/purpose,
+ * already used, or its use cannot be recorded (fail closed).
+ */
+function webauthn_use_challenge(string $purpose, string $username, string $client_data_json, callable $verify) {
+	$now = time();
+	$parsed = webauthn_parse_challenge($purpose, $username, $client_data_json, $now);
+	if ($parsed === null) {
+		return null;
+	}
+	[$challenge, $nonce, $expires] = $parsed;
+	return webauthn_with_lock(WEBAUTHN_USED_FILE, function () use ($challenge, $nonce, $expires, $now, $verify) {
+		$used = webauthn_used_nonces($now);
+		if ($used === null || isset($used[$nonce]) || count($used) >= WEBAUTHN_MAX_LIVE_NONCES) {
+			return null;
+		}
+		$result = $verify($challenge);
+		$used[$nonce] = $expires;
+		if (!webauthn_write_json(WEBAUTHN_USED_FILE, $used)) {
+			throw new WebAuthnException('The used-challenge list could not be written');
+		}
+		return $result;
+	}, null);
+}
+
+/* Validate a challenge and record it as used; returns the raw challenge or null (see webauthn_use_challenge()). */
+function webauthn_take_challenge(string $purpose, string $username, string $client_data_json): ?string {
+	try {
+		return webauthn_use_challenge($purpose, $username, $client_data_json, function ($challenge) {
+			return $challenge;
+		});
+	} catch (WebAuthnException $e) {
+		return null;
+	}
+}
+
+/*
+ * Unexpired used nonces (nonce => expiry); null when the list cannot be
+ * trusted: a damaged list may hold nonces that are still valid, so it is
+ * refused until every challenge it could hold has expired. Call with the
+ * used-challenge lock held.
+ */
+function webauthn_used_nonces(int $now): ?array {
+	$raw = @file_get_contents(WEBAUTHN_USED_FILE);
+	$used = ($raw === false) ? [] : json_decode($raw, true);
+	if (!is_array($used)) {
+		clearstatcache(true, WEBAUTHN_USED_FILE);
+		if ($now - (int)@filemtime(WEBAUTHN_USED_FILE) <= WEBAUTHN_CHALLENGE_TTL) {
+			return null;
+		}
+		$used = [];
+	}
+	return array_filter($used, function ($exp) use ($now) {
+		return is_int($exp) && $exp >= $now;
+	});
 }
 
 /*
  * Record a nonce as used. False if it was already used, or if that
- * cannot be known (the list cannot be read or written).
+ * cannot be known (the list cannot be read or written, or holds
+ * WEBAUTHN_MAX_LIVE_NONCES unexpired entries).
  */
-function webauthn_mark_nonce_used(string $nonce, int $expires): bool {
-	return webauthn_with_lock(WEBAUTHN_USED_FILE, function () use ($nonce, $expires) {
-		$now = time();
-		$raw = @file_get_contents(WEBAUTHN_USED_FILE);
-		$used = ($raw === false) ? [] : json_decode($raw, true);
-		if (!is_array($used)) {
-			/* A damaged list may hold nonces that are still valid: refuse
-			 * until every challenge it could hold has expired. */
-			clearstatcache(true, WEBAUTHN_USED_FILE);
-			if ($now - (int)@filemtime(WEBAUTHN_USED_FILE) <= WEBAUTHN_CHALLENGE_TTL) {
-				return false;
-			}
-			$used = [];
+function webauthn_mark_nonce_used(string $nonce, int $expires, ?int $now = null): bool {
+	$now = $now ?? time();
+	return webauthn_with_lock(WEBAUTHN_USED_FILE, function () use ($nonce, $expires, $now) {
+		$used = webauthn_used_nonces($now);
+		if ($used === null || isset($used[$nonce]) || count($used) >= WEBAUTHN_MAX_LIVE_NONCES) {
+			return false;
 		}
-		$used = array_filter($used, function ($exp) use ($now) {
-			return $exp >= $now;
-		});
-		$fresh = !isset($used[$nonce]);
 		$used[$nonce] = $expires;
-		return webauthn_write_json(WEBAUTHN_USED_FILE, $used) && $fresh;
+		return webauthn_write_json(WEBAUTHN_USED_FILE, $used);
 	});
 }
