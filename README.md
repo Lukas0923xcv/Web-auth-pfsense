@@ -13,7 +13,7 @@ Target: pfSense CE 2.8.1. The hook anchors on the `session_auth()` block in `/et
 
 Supported algorithms: ES256, RS256, and Ed25519 (when PHP's sodium extension is present). These cover current platform passkeys (iCloud Keychain, Google Password Manager, Windows Hello) and hardware keys (YubiKey and others). Attestation is not requested (`attestation: "none"`).
 
-Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, so they are included in config backups. Signature counters, the list of used challenges, the list of removed passkey IDs and the notice rate limit are kept in `/conf` (`webauthn_signcount.json`, `webauthn_used_challenges.json`, `webauthn_revoked.json`, `webauthn_notices.json`) so that a login does not create a new config revision. Changes to passkeys and settings are made under a lock on the configuration as it is on disk at that moment, so two parallel requests cannot undo each other's changes. If `webauthn_revoked.json` is ever damaged, no passkey is accepted until it is repaired or removed (fail closed; the system log says so).
+Passkeys and settings live in `config.xml` under `installedpackages/webauthn`, so they are included in config backups. Signature counters, the list of used challenges, the list of removed passkey IDs and the notice rate limit are kept in `/conf` (`webauthn_signcount.json`, `webauthn_used_challenges.json`, `webauthn_revoked.json`, `webauthn_notices.json`) so that a login does not create a new config revision. Changes to passkeys and settings are made under a lock on the configuration as it is on disk at that moment, so two parallel requests cannot undo each other's changes. If `webauthn_revoked.json` or `webauthn_signcount.json` is ever damaged, no passkey is accepted until it is repaired or removed (fail closed; the system log says so).
 
 ## Install
 
@@ -165,7 +165,7 @@ php tests/audit_test.php                 # security audit regressions F1-F7, inc
 php tests/review3/review3_test.php       # third review: username spellings, revocation, XMLRPC peers, nonce list (44 checks)
 php tests/review3/gate_ldap_variant.php  # third review, end to end through the gate (5 checks)
 php tests/review3/fuzz_parsers.php       # mutation fuzz of the CBOR / authenticator data / COSE parsers
-php tests/review4/review4_test.php       # fourth review: counter, verification binding, lost updates, names, uid, hardening (108 checks)
+php tests/review4/review4_test.php       # fourth review: counter, verification binding, lost updates, names, uid, hardening (113 checks)
 php tests/review4/gate_review4.php       # fourth review, end to end through the gate (14 checks)
 php tests/review4/reload_fallback.php    # fourth review: config reload on pfSense versions without config_read_file() (4 checks)
 sh tests/review3/hook_enospc.sh          # root on Linux: patching on a full disk leaves authgui.inc untouched

@@ -17,7 +17,7 @@ pfSense behaviour was checked against `pfsense/pfsense` master (no public 2.8.1 
 | Does the XML writer filter control characters? | No: `htmlentities(…, ENT_SUBSTITUTE \| ENT_XML1)` replaces invalid UTF-8 but keeps `\x0b` etc., which makes config.xml invalid XML 1.0 | 7 (confirmed, not only a hint) |
 | `system/authserver` entries | `type` is `ldap` or `radius` | 4: Settings warning |
 
-Tests: `tests/review4/review4_test.php` (108 checks), `tests/review4/gate_review4.php` (14 checks, through the real `webauthn_gate()`) and `tests/review4/reload_fallback.php` (4 checks, pfSense without `config_read_file()`). All earlier suites pass unchanged in substance; their stubs now return the config from `write_config()` as pfSense does, use temp paths for the new state files, and build verification states with the new fields.
+Tests: `tests/review4/review4_test.php` (113 checks), `tests/review4/gate_review4.php` (14 checks, through the real `webauthn_gate()`) and `tests/review4/reload_fallback.php` (4 checks, pfSense without `config_read_file()`). All earlier suites pass unchanged in substance; their stubs now return the config from `write_config()` as pfSense does, use temp paths for the new state files, and build verification states with the new fields.
 
 ## Status
 
@@ -52,6 +52,8 @@ Tests: `tests/review4/review4_test.php` (108 checks), `tests/review4/gate_review
 | R4-C A damaged revocation list would let passkeys that were removed and brought back by a restore count again. | A damaged list fails closed: every passkey still counts as present (no skipping), none is accepted, and no passkey can be added or removed until the file is repaired or removed; logged once. | review4 §8 "damaged revocation list" |
 | R4-D On pfSense without `config_read_file()` the reload of item 3 would silently not happen. | Fallback to `parse_xml_config()` on config.xml; refuse the change if that fails too. | reload_fallback.php |
 | R4-E A config with a single local user stored as a bare element (not a list) would resolve no local account, refusing every local sign-in (fail closed, but wrong). | `webauthn_local_user()` wraps a bare element, as the credential list already did. | review4 §5 "lone user element" |
+| R4-G Registering a revoked credential ID lifted the revocation before the config was saved, without checking the result. If the save failed (for example for a user with pfSense's "Deny Config Write" privilege), an old record of that ID brought back by a restore became valid again; with attestation "none" anyone may choose the ID. | The revocation is lifted only after `write_config()` succeeded; a failure there is reported. | review4 §8 "re-registering a revoked ID" (fails against the previous code) |
+| R4-H A damaged signature counter file was read as empty: the next sign-in was accepted and stored a file with only its own counter, wiping all others and so the clone detection. | A damaged counter file (like the revocation list) refuses sign-ins and registrations and is left untouched until repaired or removed; logged once. An unreadable used-challenge list is treated as damaged too. | review4 §1 "damaged counter file" |
 | R4-F The revocation list is not in config backups: restoring a backup taken before a removal onto a reinstalled firewall brings that passkey back. An old backup is the old state, so code cannot prevent it. | README says to remove such passkeys again after a restore onto a reinstalled system. | — |
 
 ## Complete recheck after all fixes
@@ -65,7 +67,7 @@ Every file was re-read in its final state. `xmlrpc_guard.inc`, `hook.inc`, `hook
 | Identity | local: exact lookup in `system/user` (bare element handled), '' refused; remote: typed name plus folded spellings; no-intl fallback | sound |
 | Ceremonies | challenge HMAC (purpose, session, exact user), expiry window both ways, recorded only after full success under one lock, list cap only reachable by completed ceremonies | sound |
 | WebAuthn verification | unchanged verifier, 20 000-input fuzz clean; counter compared and stored atomically | sound |
-| Storage | config changes under own lock on reloaded config (both pfSense variants), success checked, removal confirmed; revocation list fail closed; all state files written whole, 0600, per-process temp | sound |
+| Storage | config changes under own lock on reloaded config (both pfSense variants), success checked, removal confirmed; revocation lifted only after a successful save; revocation list, counter file and used-challenge list fail closed when damaged or unreadable; all state files written whole, 0600, per-process temp | sound |
 | Lock order | used-challenge → counter (login); config → counter → revoked (add); revoked, then config, then counter (remove): no cycle | sound |
 | Lower-privileged user | own passkeys only; cannot revoke or reuse others' IDs (existence checked for the own name, duplicate IDs refused); last passkey needs a verified session | sound |
 | Output | every page value escaped; notices and config history plain text; passkey names restricted | sound |

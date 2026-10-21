@@ -42,6 +42,9 @@ function config_set_path($path, $value) {
 	$c = $value;
 }
 function write_config($desc) {
+	if (!empty($GLOBALS['write_fails'])) {
+		return false;
+	}
 	$GLOBALS['last_desc'] = $desc;
 	$GLOBALS['disk'] = $GLOBALS['test_config'];
 	return $GLOBALS['disk'];
@@ -112,6 +115,11 @@ check(!webauthn_advance_sign_count('c1', 10), '1: 50 -> 10 refused (clone or rep
 check(webauthn_get_sign_count('c1') === 50, '1: stored counter stays 50');
 check(!webauthn_advance_sign_count('c1', 50), '1: equal counter refused');
 check(webauthn_advance_sign_count('c0', 0) && webauthn_advance_sign_count('c0', 0), '1: authenticators without a counter (0/0) accepted');
+$intact = file_get_contents(WEBAUTHN_COUNTER_FILE);
+file_put_contents(WEBAUTHN_COUNTER_FILE, '{damaged');
+check(!webauthn_advance_sign_count('c1', 1000) && !webauthn_set_sign_count('new', 0), '1: damaged counter file: nothing accepted or stored');
+check(file_get_contents(WEBAUTHN_COUNTER_FILE) === '{damaged', '1: ...and the other counters are not wiped');
+file_put_contents(WEBAUTHN_COUNTER_FILE, $intact);
 @mkdir(WEBAUTHN_COUNTER_FILE . '.' . getmypid() . '.tmp');
 check(!webauthn_advance_sign_count('c1', 60), '1: counter that cannot be stored refused');
 check(!webauthn_set_sign_count('c1', 61), '1: set_sign_count reports a failed write');
@@ -263,6 +271,24 @@ $ch = random_bytes(32);
 [$cd, $att] = $a2->create($ch, $rp, "https://$rp");
 check(webauthn_add_credential('admin', 'again', webauthn_verify_registration($cd, $att, $ch, $rp, ["https://$rp"], false), $rp) === null &&
     webauthn_find_credential('admin', $rid) !== null, '8: registering the same ID again makes it valid again');
+
+/* Re-registering a revoked ID whose old record a restore brought back: if the save fails, the old record stays revoked. */
+reset_config($settings, $users);
+$oid = register($settings, 'admin');
+$old = $GLOBALS['test_config']['installedpackages']['webauthn']['item'][0];
+webauthn_delete_credential($oid, null);
+$GLOBALS['test_config']['installedpackages']['webauthn']['item'] = [$old];          /* restore */
+$GLOBALS['disk'] = $GLOBALS['test_config'];
+$fake = new FakeAuthenticator(WEBAUTHN_ALG_ES256);
+$fake->id = webauthn_b64url_decode($oid);                                           /* attestation "none": any ID */
+$ch = random_bytes(32);
+[$cd, $att] = $fake->create($ch, $rp, "https://$rp");
+$freg = webauthn_verify_registration($cd, $att, $ch, $rp, ["https://$rp"], false);
+$GLOBALS['write_fails'] = true;                                                      /* e.g. "Deny Config Write" */
+check(webauthn_add_credential('carol', 'k', $freg, $rp) !== null, '8: registration reports the failed save');
+$GLOBALS['write_fails'] = false;
+check(webauthn_find_credential('admin', $oid) === null && isset(webauthn_revoked_ids()[$oid]),
+    '8: ...and the restored old record stays revoked');
 
 /* A damaged revocation list fails closed: passkeys still count (no skipping), none is accepted, no change is made. */
 reset_config($settings, $users);

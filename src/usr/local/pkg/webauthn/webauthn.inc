@@ -765,16 +765,10 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 		$all = array_values($all);
 		/* Stored before the passkey becomes usable: a counter that cannot
 		 * be kept would make clone detection meaningless. */
-		if (!webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $reg) {
-			$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
-			$data = is_array($data) ? $data : [];
-			$data[$id] = (int)$reg['sign_count'];
-			return webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
-		})) {
+		if (!webauthn_set_sign_count($id, (int)$reg['sign_count'])) {
 			$error = gettext('The signature counter could not be stored.');
 			return false;
 		}
-		webauthn_unrevoke($id);
 		$rec = [
 			'username' => webauthn_normalize_username($username),
 			'name' => $name,
@@ -792,6 +786,11 @@ function webauthn_add_credential(string $username, string $name, array $reg, str
 	}, sprintf('WebAuthn: registered passkey "%s" for user "%s"', webauthn_plain($name), webauthn_plain($username)));
 	if (!$ok) {
 		return $error ?? gettext('The configuration could not be saved.');
+	}
+	/* Only now, with the record that replaces any revoked one saved: lifting
+	 * the revocation earlier would revive that old record if the save failed. */
+	if (!webauthn_unrevoke($id)) {
+		return gettext('The passkey was saved but cannot be used yet: the list of removed passkeys could not be updated.');
 	}
 	return null;
 }
@@ -813,15 +812,12 @@ function webauthn_delete_credential(string $id, ?string $username = null): bool 
 	if (!webauthn_revoke($id)) {
 		return false;
 	}
-	$names = [];
-	$ok = webauthn_config_update(function () use ($match, &$names) {
+	$ok = webauthn_config_update(function () use ($match) {
 		$all = config_get_path(WEBAUTHN_CRED_PATH, []);
 		$all = is_array($all) ? (isset($all['id']) && !is_array($all['id']) ? [$all] : $all) : [];
 		$keep = [];
 		foreach ($all as $c) {
-			if ($match($c)) {
-				$names[] = sprintf('"%s" of user "%s"', webauthn_plain((string)($c['name'] ?? '')), webauthn_plain((string)($c['username'] ?? '')));
-			} elseif (is_array($c)) {
+			if (is_array($c) && !$match($c)) {
 				$keep[] = $c;
 			}
 		}
@@ -836,7 +832,7 @@ function webauthn_delete_credential(string $id, ?string $username = null): bool 
 		}
 	}
 	webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id) {
-		$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
+		$data = webauthn_read_counters();
 		if (is_array($data) && isset($data[$id])) {
 			unset($data[$id]);
 			webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
@@ -894,17 +890,38 @@ function webauthn_unrevoke(string $id): bool {
 
 /*
  * Signature counters are kept outside config.xml so that every login
- * does not create a configuration revision.
+ * does not create a configuration revision. A damaged counter file is
+ * not read as empty (that would reset every counter): counters are then
+ * neither checked nor stored, so passkey sign-ins fail until it is
+ * repaired or removed.
  */
+function webauthn_read_counters(): ?array {
+	$raw = @file_get_contents(WEBAUTHN_COUNTER_FILE);
+	if ($raw === false) {
+		return file_exists(WEBAUTHN_COUNTER_FILE) ? null : [];
+	}
+	$data = json_decode($raw, true);
+	if (!is_array($data)) {
+		static $logged = false;
+		if (!$logged) {
+			$logged = true;
+			webauthn_log(LOG_ERR, WEBAUTHN_COUNTER_FILE . ' is damaged: passkey sign-ins fail until it is repaired or removed');
+		}
+		return null;
+	}
+	return $data;
+}
+
 function webauthn_get_sign_count(string $id): int {
-	$data = @json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
-	return (int)($data[$id] ?? 0);
+	return (int)(webauthn_read_counters()[$id] ?? 0);
 }
 
 function webauthn_set_sign_count(string $id, int $count): bool {
 	return webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $count) {
-		$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
-		$data = is_array($data) ? $data : [];
+		$data = webauthn_read_counters();
+		if ($data === null) {
+			return false;
+		}
 		$data[$id] = $count;
 		return webauthn_write_json(WEBAUTHN_COUNTER_FILE, $data);
 	});
@@ -918,8 +935,10 @@ function webauthn_set_sign_count(string $id, int $count): bool {
  */
 function webauthn_advance_sign_count(string $id, int $count): bool {
 	return webauthn_with_lock(WEBAUTHN_COUNTER_FILE, function () use ($id, $count) {
-		$data = json_decode((string)@file_get_contents(WEBAUTHN_COUNTER_FILE), true);
-		$data = is_array($data) ? $data : [];
+		$data = webauthn_read_counters();
+		if ($data === null) {
+			return false;
+		}
 		$stored = (int)($data[$id] ?? 0);
 		if (($count != 0 || $stored != 0) && $count <= $stored) {
 			return false;
@@ -1114,7 +1133,7 @@ function webauthn_take_challenge(string $purpose, string $username, string $clie
  */
 function webauthn_used_nonces(int $now): ?array {
 	$raw = @file_get_contents(WEBAUTHN_USED_FILE);
-	$used = ($raw === false) ? [] : json_decode($raw, true);
+	$used = ($raw === false) ? (file_exists(WEBAUTHN_USED_FILE) ? null : []) : json_decode($raw, true);
 	if (!is_array($used)) {
 		clearstatcache(true, WEBAUTHN_USED_FILE);
 		if ($now - (int)@filemtime(WEBAUTHN_USED_FILE) <= WEBAUTHN_CHALLENGE_TTL) {
