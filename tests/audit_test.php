@@ -144,6 +144,19 @@ check(run_auth_check($patched, $config, ['Username' => 'admin', 'page-match' => 
 check(run_auth_check($patched, $config, ['Username' => 'admin', 'page-match' => $pm,
     'webauthn' => ['user' => 'admin', 'method' => 'trusted-network']], $lan) === 'CACHED',
     'F1: trusted-network request keeps the fast path');
+/* Fourth review: local sessions are resolved through system/user, in auth_check.inc's lean context too. */
+$local_cfg = $config + ['system' => ['user' => [['name' => 'admin', 'uid' => '0']]]];
+check(run_auth_check($patched, $local_cfg, ['Username' => 'admin', 'authsource' => 'Local Database', 'page-match' => $pm,
+    'webauthn' => ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred['record']['id'],
+    'time' => time(), 'sid' => '', 'rp_id' => $rp, 'uv' => false]], $tunnel) === 'CACHED',
+    'R4: verified local session keeps the fast path (only config.inc loaded)');
+check(run_auth_check($patched, $local_cfg, ['Username' => 'ghost', 'authsource' => 'Local Database', 'page-match' => $pm,
+    'webauthn' => ['user' => 'ghost', 'method' => 'trusted-network']], $lan) === 'AUTHGUI',
+    'R4: local name without an account gets no cached privileges, even from a trusted network');
+check(run_auth_check($patched, $local_cfg, ['Username' => 'admin', 'authsource' => 'Local Database', 'page-match' => $pm,
+    'webauthn' => ['user' => 'admin', 'method' => 'webauthn', 'credential' => $cred['record']['id'],
+    'time' => time() - 13 * 3600, 'sid' => '', 'rp_id' => $rp, 'uv' => false]], $tunnel) === 'AUTHGUI',
+    'R4: expired verification gets no cached privileges');
 $disabled = $config;
 $disabled['installedpackages']['webauthn']['config'][0]['enable'] = '';
 check(run_auth_check($patched, $disabled, ['Username' => 'admin', 'page-match' => $pm], $tunnel) === 'CACHED',

@@ -214,6 +214,8 @@ check(webauthn_session_status($settings, ['Username' => '1e3'] + $local, $tunnel
 check(webauthn_session_status($settings, ['Username' => '1000'] + $local, $tunnel) === 'require', '5: account with a passkey requires');
 check(webauthn_session_status($settings, ['Username' => 'nobody'] + $local, $tunnel) === 'require', '5: unknown local account requires');
 check(webauthn_session_identity(['Username' => 'Someone@x'] + $ldap) === 'Someone@x', '5: remote names unchanged');
+$GLOBALS['test_config']['system']['user'] = ['name' => 'solo', 'uid' => '2005'];   /* a single user, not a list */
+check(webauthn_session_identity(['Username' => 'solo'] + $local) === 'solo', '5: a lone user element resolves too');
 
 /* ---- 6. Names in notices and config history are plain one-line text ---- */
 $evil = "eve\n2026-01-01 webauthn: forged\r\x0b\u{202E}gnp.exe\u{2028}x" . "\xff";

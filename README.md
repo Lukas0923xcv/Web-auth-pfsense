@@ -126,7 +126,7 @@ When you reach the GUI by an IP or another unlisted name from outside a trusted 
 
 Once a user has a passkey, adding another requires a session that signed in **with** a passkey. A password alone, even from a trusted network, cannot enrol an extra passkey. While the second factor is disabled nobody signs in with a passkey, so then only an admin can add a further passkey to an account that has one; the first passkey of an account always needs only the password. Users other than admins cannot remove their **last** passkey without a passkey-verified session.
 
-Removing a passkey signs out the sessions it verified at their next request, even when it was the user's last passkey. Its ID is also recorded as revoked in `/conf/webauthn_revoked.json`: it is never accepted again, even if a config restore or a parallel change brings the record back. Passkeys registered by a local account remember the account's uid; if the account is deleted and a new one is created with the same name, the old passkeys do not count for it and are shown as "belongs to a deleted account" (passkeys registered before this version, and passkeys of LDAP/RADIUS accounts, have no uid and are bound to the name only).
+Removing a passkey signs out the sessions it verified at their next request, even when it was the user's last passkey. Its ID is also recorded as revoked in `/conf/webauthn_revoked.json`: it is never accepted again, even if a config restore or a parallel change brings the record back. That list lives outside config.xml, so it is not in config backups: after reinstalling pfSense and restoring a backup taken before a passkey was removed, remove that passkey again. Passkeys registered by a local account remember the account's uid; if the account is deleted and a new one is created with the same name, the old passkeys do not count for it and are shown as "belongs to a deleted account" (passkeys registered before this version, and passkeys of LDAP/RADIUS accounts, have no uid and are bound to the name only).
 
 Recovery, if every passkey is lost: an admin logs in from a trusted network, removes the lost passkeys, then registers a new one. Users other than admins ask an admin. Without a trusted network, run `/usr/local/pkg/webauthn/hook.php uninstall` from the console.
 
@@ -161,11 +161,11 @@ Errors inside the gate fail closed: the page does not load.
 ```sh
 php tests/run.php                        # verifier, CBOR, policy, settings validation, authgui hook (79 checks)
 php tests/gate_test.php                  # end-to-end gate requests with a software authenticator (14 checks)
-php tests/audit_test.php                 # security audit regressions F1-F7, incl. the real patched auth_check.inc (50 checks)
+php tests/audit_test.php                 # security audit regressions F1-F7, incl. the real patched auth_check.inc (53 checks)
 php tests/review3/review3_test.php       # third review: username spellings, revocation, XMLRPC peers, nonce list (44 checks)
 php tests/review3/gate_ldap_variant.php  # third review, end to end through the gate (5 checks)
 php tests/review3/fuzz_parsers.php       # mutation fuzz of the CBOR / authenticator data / COSE parsers
-php tests/review4/review4_test.php       # fourth review: counter, verification binding, lost updates, names, uid, hardening (107 checks)
+php tests/review4/review4_test.php       # fourth review: counter, verification binding, lost updates, names, uid, hardening (108 checks)
 php tests/review4/gate_review4.php       # fourth review, end to end through the gate (14 checks)
 php tests/review4/reload_fallback.php    # fourth review: config reload on pfSense versions without config_read_file() (4 checks)
 sh tests/review3/hook_enospc.sh          # root on Linux: patching on a full disk leaves authgui.inc untouched

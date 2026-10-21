@@ -168,7 +168,9 @@ function webauthn_session_is_local(array $session): bool {
  */
 function webauthn_local_user(string $name): ?array {
 	$found = null;
-	foreach (config_get_path('system/user', []) as $u) {
+	$users = config_get_path('system/user', []);
+	$users = is_array($users) ? (isset($users['name']) && !is_array($users['name']) ? [$users] : $users) : [];
+	foreach ($users as $u) {
 		if (is_array($u) && isset($u['name']) && (string)$u['name'] === $name) {
 			$found = $u;
 		}
