@@ -28,42 +28,45 @@ master)
 release)
 	# pfSense's pkg repositories are found through DNS SRV records
 	# (_https._tcp.pkg.pfsense.org): the name itself has no address.
-	if [ -z "${PFSENSE_REPO:-}" ]; then
+	if [ -z "${PFSENSE_MIRROR:-}" ]; then
 		srv=$(dig +short SRV _https._tcp.pkg.pfsense.org 2>/dev/null | sort -n | head -n 1)
 		echo "SRV _https._tcp.pkg.pfsense.org: ${srv:-none}"
 		host=$(echo "$srv" | awk '{print $4}' | sed 's/\.$//')
-		PFSENSE_REPO="https://${host:-pkg.pfsense.org}/pfSense_v2_8_1_amd64-core"
+		PFSENSE_MIRROR="https://${host:-pkg.pfsense.org}"
 	fi
-	repo=$PFSENSE_REPO
-	curl -fsSL --retry 3 -o "$dir/packagesite.pkg" "$repo/packagesite.pkg"
-	tar -xf "$dir/packagesite.pkg" -C "$dir" packagesite.yaml
-	# Look for the GUI's PHP files in the core pfSense packages (not the
-	# add-on pfSense-pkg-* ones), smallest first.
-	# shellcheck disable=SC2016 # PHP code, not shell
-	names=$("$php" -r '$c = []; foreach (file($argv[1]) as $l) { $p = json_decode($l, true);
-		if (str_starts_with($p["name"] ?? "", "pfSense") && !str_starts_with($p["name"], "pfSense-pkg-")) { $c[$p["name"]] = $p["pkgsize"] ?? 0; } }
-		asort($c); echo implode(" ", array_keys($c));' "$dir/packagesite.yaml")
-	echo "core packages: $names"
+	# A release has two repositories: -core (base system, kernel) and the
+	# one with the pfSense packages, among them the GUI.
 	found=0
-	for name in $names; do
-		# One JSON object per line; take this package's path and version.
+	for repo in "$PFSENSE_MIRROR/pfSense_v2_8_1_amd64-pfSense_v2_8_1" "$PFSENSE_MIRROR/pfSense_v2_8_1_amd64-core"; do
+		curl -fsSL --retry 3 -o "$dir/packagesite.pkg" "$repo/packagesite.pkg" || { echo "no package index at $repo"; continue; }
+		rm -f "$dir/packagesite.yaml"
+		tar -xf "$dir/packagesite.pkg" -C "$dir" packagesite.yaml
+		# Core pfSense packages (not the add-on pfSense-pkg-* ones), smallest first.
 		# shellcheck disable=SC2016 # PHP code, not shell
-		info=$("$php" -r 'foreach (file($argv[1]) as $l) { $p = json_decode($l, true);
-			if (($p["name"] ?? "") === $argv[2]) { echo $p["repopath"], " ", $p["version"]; break; } }' "$dir/packagesite.yaml" "$name")
-		[ -n "$info" ] || continue
-		path=${info% *}
-		version=${info##* }
-		curl -fsSL --retry 3 -o "$dir/pkg" "$repo/$path"
-		if tar -tf "$dir/pkg" | grep -q 'etc/inc/authgui\.inc$'; then
-			echo "$name $version from $repo/$path"
-			mkdir -p "$dir/x"
-			tar -xf "$dir/pkg" -C "$dir/x" --wildcards '*etc/inc/authgui.inc' '*etc/inc/auth_check.inc' '*usr/local/www/xmlrpc.php'
-			found=1
-			break
-		fi
-		echo "$name $version: no etc/inc/authgui.inc in it"
+		names=$("$php" -r '$c = []; foreach (file($argv[1]) as $l) { $p = json_decode($l, true);
+			if (str_starts_with($p["name"] ?? "", "pfSense") && !str_starts_with($p["name"], "pfSense-pkg-")) { $c[$p["name"]] = $p["pkgsize"] ?? 0; } }
+			asort($c); echo implode(" ", array_keys($c));' "$dir/packagesite.yaml")
+		echo "$repo: $names"
+		for name in $names; do
+			# One JSON object per line; take this package's path and version.
+			# shellcheck disable=SC2016 # PHP code, not shell
+			info=$("$php" -r 'foreach (file($argv[1]) as $l) { $p = json_decode($l, true);
+				if (($p["name"] ?? "") === $argv[2]) { echo $p["repopath"], " ", $p["version"]; break; } }' "$dir/packagesite.yaml" "$name")
+			[ -n "$info" ] || continue
+			path=${info% *}
+			version=${info##* }
+			curl -fsSL --retry 3 -o "$dir/pkg" "$repo/$path"
+			if tar -tf "$dir/pkg" 2>/dev/null | grep -q 'etc/inc/authgui\.inc$'; then
+				echo "$name $version from $repo/$path"
+				mkdir -p "$dir/x"
+				tar -xf "$dir/pkg" -C "$dir/x" --wildcards '*etc/inc/authgui.inc' '*etc/inc/auth_check.inc' '*usr/local/www/xmlrpc.php' 2>/dev/null
+				found=1
+				break 2
+			fi
+			echo "  $name $version: no etc/inc/authgui.inc in it"
+		done
 	done
-	[ "$found" = 1 ] || { echo "authgui.inc not found in the 2.8.1 packages of $repo"; exit 1; }
+	[ "$found" = 1 ] || { echo "authgui.inc not found in the pfSense 2.8.1 packages"; exit 1; }
 	for f in authgui.inc auth_check.inc xmlrpc.php; do
 		find "$dir/x" -name "$f" -exec cp {} "$dir/$f" \;
 	done
