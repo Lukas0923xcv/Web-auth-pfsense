@@ -26,7 +26,15 @@ master)
 	echo "pfsense/pfsense master at $(git ls-remote https://github.com/pfsense/pfsense refs/heads/master | cut -f1)"
 	;;
 release)
-	repo=${PFSENSE_REPO:-https://pkg.pfsense.org/pfSense_v2_8_1_amd64-core}
+	# pfSense's pkg repositories are found through DNS SRV records
+	# (_https._tcp.pkg.pfsense.org): the name itself has no address.
+	if [ -z "${PFSENSE_REPO:-}" ]; then
+		srv=$(dig +short SRV _https._tcp.pkg.pfsense.org 2>/dev/null | sort -n | head -n 1)
+		echo "SRV _https._tcp.pkg.pfsense.org: ${srv:-none}"
+		host=$(echo "$srv" | awk '{print $4}' | sed 's/\.$//')
+		PFSENSE_REPO="https://${host:-pkg.pfsense.org}/pfSense_v2_8_1_amd64-core"
+	fi
+	repo=$PFSENSE_REPO
 	curl -fsSL --retry 3 -o "$dir/packagesite.pkg" "$repo/packagesite.pkg"
 	tar -xf "$dir/packagesite.pkg" -C "$dir" packagesite.yaml
 	path=$(grep '"name":"pfSense-base"' "$dir/packagesite.yaml" | head -n 1 | sed 's/.*"repopath":"\([^"]*\)".*/\1/')
