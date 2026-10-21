@@ -37,9 +37,15 @@ release)
 	repo=$PFSENSE_REPO
 	curl -fsSL --retry 3 -o "$dir/packagesite.pkg" "$repo/packagesite.pkg"
 	tar -xf "$dir/packagesite.pkg" -C "$dir" packagesite.yaml
-	# The GUI's PHP files are in the "pfSense" package; look in pfSense-base too.
+	# Look for the GUI's PHP files in the core pfSense packages (not the
+	# add-on pfSense-pkg-* ones), smallest first.
+	# shellcheck disable=SC2016 # PHP code, not shell
+	names=$("$php" -r '$c = []; foreach (file($argv[1]) as $l) { $p = json_decode($l, true);
+		if (str_starts_with($p["name"] ?? "", "pfSense") && !str_starts_with($p["name"], "pfSense-pkg-")) { $c[$p["name"]] = $p["pkgsize"] ?? 0; } }
+		asort($c); echo implode(" ", array_keys($c));' "$dir/packagesite.yaml")
+	echo "core packages: $names"
 	found=0
-	for name in pfSense pfSense-base; do
+	for name in $names; do
 		# One JSON object per line; take this package's path and version.
 		# shellcheck disable=SC2016 # PHP code, not shell
 		info=$("$php" -r 'foreach (file($argv[1]) as $l) { $p = json_decode($l, true);
